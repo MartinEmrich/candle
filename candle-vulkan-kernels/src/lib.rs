@@ -1,0 +1,77 @@
+//! SPIR-V compute kernels for the candle Vulkan backend.
+//!
+//! Shaders live as GLSL next to this file and are compiled to SPIR-V by
+//! `build.rs` (glslc). Kernels ported from ggml-vulkan (MIT) keep their
+//! attribution in the file header; see NOTICE.
+
+// Kernels ported from ggml-vulkan (https://github.com/ggml-org/llama.cpp), MIT,
+// Copyright (c) The ggml authors, will keep their attribution in the file header
+// and be listed in NOTICE.
+
+pub const FILL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fill.spv"));
+pub const AFFINE_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/affine_f32.spv"));
+pub const ADD_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_f32.spv"));
+pub const SUB_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sub_f32.spv"));
+pub const ADD_U32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_u32.spv"));
+pub const SUB_U32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sub_u32.spv"));
+pub const MUL_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_f32.spv"));
+pub const DIV_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/div_f32.spv"));
+pub const MINIMUM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/minimum_f32.spv"));
+pub const MAXIMUM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/maximum_f32.spv"));
+
+macro_rules! unary_kernel {
+    ($name:ident, $file:literal) => {
+        pub const $name: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/", $file, ".spv"));
+    };
+}
+unary_kernel!(EXP_F32, "exp_f32");
+unary_kernel!(LOG_F32, "log_f32");
+unary_kernel!(SIN_F32, "sin_f32");
+unary_kernel!(COS_F32, "cos_f32");
+unary_kernel!(TANH_F32, "tanh_f32");
+unary_kernel!(NEG_F32, "neg_f32");
+unary_kernel!(RECIP_F32, "recip_f32");
+unary_kernel!(SQR_F32, "sqr_f32");
+unary_kernel!(SQRT_F32, "sqrt_f32");
+unary_kernel!(ABS_F32, "abs_f32");
+unary_kernel!(CEIL_F32, "ceil_f32");
+unary_kernel!(FLOOR_F32, "floor_f32");
+unary_kernel!(ROUND_F32, "round_f32");
+unary_kernel!(RELU_F32, "relu_f32");
+unary_kernel!(SIGN_F32, "sign_f32");
+unary_kernel!(ERF_F32, "erf_f32");
+unary_kernel!(GELU_F32, "gelu_f32");
+unary_kernel!(GELU_ERF_F32, "gelu_erf_f32");
+unary_kernel!(SILU_F32, "silu_f32");
+
+pub const REDUCE_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/reduce_f32.spv"));
+pub const CMP_EQ_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cmp_eq_f32.spv"));
+pub const CMP_NE_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cmp_ne_f32.spv"));
+pub const CMP_LT_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cmp_lt_f32.spv"));
+pub const CMP_LE_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cmp_le_f32.spv"));
+pub const CMP_GT_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cmp_gt_f32.spv"));
+pub const CMP_GE_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cmp_ge_f32.spv"));
+pub const F32_TO_BOOL_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/f32_to_bool_f32.spv"));
+pub const WHERE_COND_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/where_cond_f32.spv"));
+pub const F16_TO_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f16_to_f32.spv"));
+pub const F32_TO_F16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_to_f16.spv"));
+pub const BF16_TO_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bf16_to_f32.spv"));
+pub const F32_TO_BF16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_to_bf16.spv"));
+pub const BOOL_TO_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bool_to_f32.spv"));
+pub const COPY_F16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_f16.spv"));
+pub const COPY2D_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy2d_f32.spv"));
+pub const INDEX_SELECT_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/index_select_f32.spv"));
+pub const MATMUL_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32.spv"));
+pub const MATMUL_F32_SPLITK: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk.spv"));
+pub const MATMUL_F32_REDUCE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_reduce.spv"));
+pub const U32_TO_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/u32_to_f32.spv"));
+pub const F32_TO_U32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_to_u32.spv"));
+pub const I64_TO_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/i64_to_f32.spv"));
+pub const SOFTMAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/softmax_f32.spv"));
+pub const FA_VARLEN_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_f32.spv"));

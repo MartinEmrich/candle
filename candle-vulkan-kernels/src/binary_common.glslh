@@ -1,0 +1,60 @@
+// Shared body for binary elementwise kernels (f32).
+// Entry files must set: #version 450, then #define BIN_OP(a,b) <expr>,
+// then #include "binary_common.glslh".
+//
+// Output is contiguous; both inputs are accessed through (dims, strides)
+// decomposition so broadcasting (stride 0) and arbitrary views work.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Lhs {
+    float data[];
+} b_lhs;
+
+layout(set = 0, binding = 1) readonly buffer Rhs {
+    float data[];
+} b_rhs;
+
+layout(set = 0, binding = 2) buffer Dst {
+    float data[];
+} b_dst;
+
+layout(push_constant) uniform PushConstants {
+    uint lhs_offset;
+    uint rhs_offset;
+    uint dst_offset;
+    uint numel;
+    uint rank;
+    uint lhs_dims[4];
+    uint lhs_strides[4];
+    uint rhs_dims[4];
+    uint rhs_strides[4];
+} pc;
+
+uint global_index() {
+    uint idx = gl_GlobalInvocationID.x;
+    idx += gl_NumWorkGroups.x * gl_WorkGroupSize.x * gl_WorkGroupID.y;
+    idx += gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_WorkGroupSize.x * gl_WorkGroupID.z;
+    return idx;
+}
+
+uint decomp(uint idx, uint dims[4], uint strides[4], uint rank, uint offset) {
+    uint off = offset;
+    uint rem = idx;
+    for (int d = int(rank) - 1; d >= 0; --d) {
+        uint coord = rem % dims[d];
+        rem /= dims[d];
+        off += coord * strides[d];
+    }
+    return off;
+}
+
+void main() {
+    uint idx = global_index();
+    if (idx >= pc.numel) {
+        return;
+    }
+    uint li = decomp(idx, pc.lhs_dims, pc.lhs_strides, pc.rank, pc.lhs_offset);
+    uint ri = decomp(idx, pc.rhs_dims, pc.rhs_strides, pc.rank, pc.rhs_offset);
+    b_dst.data[pc.dst_offset + idx] = BIN_OP(b_lhs.data[li], b_rhs.data[ri]);
+}

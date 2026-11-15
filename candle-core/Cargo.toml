@@ -11,9 +11,11 @@ readme = "README.md"
 
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
+ash = { workspace = true, optional = true }
 byteorder = { workspace = true }
 candle-kernels = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
+candle-vulkan-kernels = { workspace = true, optional = true }
 metal = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true}
 gemm = { workspace = true }
@@ -50,6 +52,8 @@ _mkl = ["dep:libc", "dep:intel-mkl-src"]
 mkl = ["_mkl", "intel-mkl-src?/mkl-static-lp64-iomp"] 
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
+_vulkan = ["dep:ash", "dep:candle-vulkan-kernels"]
+vulkan = ["_vulkan"]
 
 [[bench]]
 name = "bench_main"
@@ -58,3 +62,7 @@ harness = false
 [[example]]
 name = "metal_basics"
 required-features = ["metal"]
+
+[[example]]
+name = "vulkan_basics"
+required-features = ["vulkan"]

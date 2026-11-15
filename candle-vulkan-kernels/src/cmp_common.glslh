@@ -1,0 +1,68 @@
+// Shared body for comparison kernels (f32 -> bool packed 4 bytes/word).
+// Entry files must set: #version 450, then #define CMP_OP(a,b) <bool expr>,
+// then #include "cmp_common.glslh".
+// Requires pc.dst_offset % 4 == 0 (true for freshly allocated bool storage).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Lhs {
+    float data[];
+} b_lhs;
+
+layout(set = 0, binding = 1) readonly buffer Rhs {
+    float data[];
+} b_rhs;
+
+layout(set = 0, binding = 2) buffer Dst {
+    uint data[];
+} b_dst;
+
+layout(push_constant) uniform PushConstants {
+    uint lhs_offset;
+    uint rhs_offset;
+    uint dst_offset;
+    uint numel;
+    uint rank;
+    uint lhs_dims[4];
+    uint lhs_strides[4];
+    uint rhs_dims[4];
+    uint rhs_strides[4];
+} pc;
+
+uint global_index() {
+    uint idx = gl_GlobalInvocationID.x;
+    idx += gl_NumWorkGroups.x * gl_WorkGroupSize.x * gl_WorkGroupID.y;
+    idx += gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_WorkGroupSize.x * gl_WorkGroupID.z;
+    return idx;
+}
+
+uint decomp(uint idx, uint dims[4], uint strides[4], uint rank, uint offset) {
+    uint off = offset;
+    uint rem = idx;
+    for (int d = int(rank) - 1; d >= 0; --d) {
+        uint coord = rem % dims[d];
+        rem /= dims[d];
+        off += coord * strides[d];
+    }
+    return off;
+}
+
+void main() {
+    uint wi = global_index() * 4u;
+    if (wi >= pc.numel) {
+        return;
+    }
+    uint r = 0u;
+    for (uint j = 0u; j < 4u; ++j) {
+        uint i = wi + j;
+        if (i >= pc.numel) {
+            break;
+        }
+        uint li = decomp(i, pc.lhs_dims, pc.lhs_strides, pc.rank, pc.lhs_offset);
+        uint ri = decomp(i, pc.rhs_dims, pc.rhs_strides, pc.rank, pc.rhs_offset);
+        if (CMP_OP(b_lhs.data[li], b_rhs.data[ri])) {
+            r |= 1u << (8u * j);
+        }
+    }
+    b_dst.data[(pc.dst_offset + wi) / 4u] = r;
+}

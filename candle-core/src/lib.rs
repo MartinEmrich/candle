@@ -63,11 +63,14 @@ pub mod display;
 mod dtype;
 pub mod dummy_cuda_backend;
 mod dummy_metal_backend;
+pub mod dummy_vulkan_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
+#[cfg(feature = "_vulkan")]
+pub mod vulkan_backend;
 #[cfg(feature = "_mkl")]
 mod mkl;
 pub mod npy;
@@ -117,6 +120,12 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
+
+#[cfg(feature = "_vulkan")]
+pub use vulkan_backend::{VulkanDevice, VulkanError, VulkanStorage};
+
+#[cfg(not(feature = "_vulkan"))]
+pub use dummy_vulkan_backend::{VulkanDevice, VulkanError, VulkanStorage};
 
 #[cfg(feature = "_mkl")]
 extern crate intel_mkl_src;

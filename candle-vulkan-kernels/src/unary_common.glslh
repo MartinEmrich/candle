@@ -1,0 +1,61 @@
+// Shared body for unary elementwise kernels (f32).
+// Entry files must set: #version 450, then #define UN_OP(a) <expr>,
+// then #include "unary_common.glslh".
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Src {
+    float data[];
+} b_src;
+
+layout(set = 0, binding = 1) buffer Dst {
+    float data[];
+} b_dst;
+
+layout(push_constant) uniform PushConstants {
+    uint src_offset;
+    uint dst_offset;
+    uint numel;
+    uint rank;
+    uint dims[4];
+    uint strides[4];
+} pc;
+
+uint global_index() {
+    uint idx = gl_GlobalInvocationID.x;
+    idx += gl_NumWorkGroups.x * gl_WorkGroupSize.x * gl_WorkGroupID.y;
+    idx += gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_WorkGroupSize.x * gl_WorkGroupID.z;
+    return idx;
+}
+
+uint decomp(uint idx, uint dims[4], uint strides[4], uint rank, uint offset) {
+    uint off = offset;
+    uint rem = idx;
+    for (int d = int(rank) - 1; d >= 0; --d) {
+        uint coord = rem % dims[d];
+        rem /= dims[d];
+        off += coord * strides[d];
+    }
+    return off;
+}
+
+// Abramowitz & Stegun 7.1.26, max abs error 1.5e-7.
+float erf_impl(float x) {
+    float sign = 1.0;
+    if (x < 0.0) {
+        sign = -1.0;
+        x = -x;
+    }
+    float t = 1.0 / (1.0 + 0.3275911 * x);
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x);
+    return sign * y;
+}
+
+void main() {
+    uint idx = global_index();
+    if (idx >= pc.numel) {
+        return;
+    }
+    uint si = decomp(idx, pc.dims, pc.strides, pc.rank, pc.src_offset);
+    b_dst.data[pc.dst_offset + idx] = UN_OP(b_src.data[si]);
+}

@@ -37,6 +37,8 @@ cuda = ["candle/cuda"]
 _mkl = ["dep:intel-mkl-src", "candle/_mkl"]
 mkl = ["candle/mkl"]
 metal = ["candle/metal", "dep:candle-metal-kernels", "dep:metal"]
+_vulkan = ["candle/_vulkan"]
+vulkan = ["_vulkan", "candle/vulkan"]
 
 [[bench]]
 name = "bench_main"

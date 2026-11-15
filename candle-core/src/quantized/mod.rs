@@ -52,6 +52,9 @@ impl Device {
                 let storage = cuda::QCudaStorage::zeros(cuda, elem_count, dtype)?;
                 Ok(QStorage::Cuda(storage))
             }
+            Device::Vulkan(_) => {
+                crate::bail!("quantized storage is not supported on vulkan")
+            }
         }
     }
 }
