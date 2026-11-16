@@ -146,5 +146,13 @@ pub const F32_TO_U32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_to_u
 pub const I64_TO_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/i64_to_f32.spv"));
 pub const SOFTMAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/softmax_f32.spv"));
 pub const FA_VARLEN_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_f32.spv"));
+pub const FA_VARLEN_TILED_F32_D64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_tiled_f32_d64.spv"));
+pub const FA_VARLEN_TILED_F32_D128: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_tiled_f32_d128.spv"));
+pub const FA_VARLEN_TILED_F16_D64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_tiled_f16_d64.spv"));
+pub const FA_VARLEN_TILED_F16_D128: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_tiled_f16_d128.spv"));
 pub const FA_VARLEN_F16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_f16.spv"));
 pub const FA_VARLEN_BF16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_bf16.spv"));

@@ -1411,6 +1411,8 @@ pub fn flash_attn_varlen(
     window_left: Option<usize>,
     window_right: Option<usize>,
     softcap: Option<f32>,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
 ) -> Result<VulkanStorage> {
     let dt = q.dtype;
     let narrow = is_narrow(dt);
@@ -1497,7 +1499,89 @@ pub fn flash_attn_varlen(
         &seqlens_k.buffer,
         alibi_buf,
     ];
-    let groups = (total_q.div_ceil(32).max(1) as u32, num_heads as u32, 1);
+    // Tiled kernel (shared-memory K/V reuse, register-resident accumulators via
+    // a compile-time head_size) for f32 with head_size 64 or 128; one workgroup
+    // per (query tile, head, sequence). Falls back to the scalar kernel for
+    // narrow dtypes and other head sizes.
+    const TILED_BR: usize = 128;
+    let tiled = match (dt, head_size) {
+        (DType::F32, 64) => Some((
+            candle_vulkan_kernels::FA_VARLEN_TILED_F32_D64,
+            "fa_varlen_tiled_f32_d64",
+        )),
+        (DType::F32, 128) => Some((
+            candle_vulkan_kernels::FA_VARLEN_TILED_F32_D128,
+            "fa_varlen_tiled_f32_d128",
+        )),
+        (DType::F16, 64) => Some((
+            candle_vulkan_kernels::FA_VARLEN_TILED_F16_D64,
+            "fa_varlen_tiled_f16_d64",
+        )),
+        (DType::F16, 128) => Some((
+            candle_vulkan_kernels::FA_VARLEN_TILED_F16_D128,
+            "fa_varlen_tiled_f16_d128",
+        )),
+        _ => None,
+    };
+
+    if let Some((spv, name)) = tiled {
+        // A single launch must finish under the amdgpu scheduler job timeout
+        // (~2s on Polaris, else the GPU is soft-recovered). Split the work into
+        // launches bounded by a MAC budget (~1.4s at the measured ~3.1e10 MAC/s).
+        // Prefer keeping all query tiles per launch (good occupancy) and split
+        // heads first; only split query tiles if a single head still exceeds the
+        // budget. Work per launch ~= x_tiles * BR * max_seqlen_k * h * 2 * head_size.
+        const MAC_BUDGET: u64 = 45_000_000_000;
+        let msq = max_seqlen_q.clamp(1, total_q);
+        let msk = max_seqlen_k.clamp(1, total_q);
+        let x_tiles_total = msq.div_ceil(TILED_BR).max(1);
+        let per_tile_macs = (TILED_BR as u64)
+            .saturating_mul(msk as u64)
+            .saturating_mul(2)
+            .saturating_mul(head_size as u64);
+        let all_x_per_head = (x_tiles_total as u64).saturating_mul(per_tile_macs);
+        let (h_chunk, x_chunk) = if all_x_per_head <= MAC_BUDGET {
+            let hc = if all_x_per_head == 0 {
+                num_heads
+            } else {
+                (MAC_BUDGET / all_x_per_head).max(1).min(num_heads as u64) as usize
+            };
+            (hc.max(1), x_tiles_total)
+        } else {
+            let xc = (MAC_BUDGET / per_tile_macs.max(1))
+                .max(1)
+                .min(x_tiles_total as u64) as usize;
+            (1, xc.max(1))
+        };
+
+        let mut pc_t = pc.clone();
+        pc_t.push(0); // head_base (index 16)
+        for hb in (0..num_heads).step_by(h_chunk) {
+            let hc = h_chunk.min(num_heads - hb) as u32;
+            pc_t[16] = hb as u32;
+            for xb in (0..x_tiles_total).step_by(x_chunk) {
+                let xc = x_chunk.min(x_tiles_total - xb) as u32;
+                q.device.inner.dispatch(
+                    spv,
+                    name,
+                    &bindings,
+                    &pc_t,
+                    (xc, hc, batch as u32),
+                )?;
+                // Each chunk must be its own submission so it gets its own GPU
+                // job timeout (the amdgpu scheduler times out per submit, not per
+                // dispatch); otherwise coalesced chunks form one over-budget job.
+                q.device.inner.flush(false)?;
+            }
+        }
+        return Ok(VulkanStorage {
+            device: q.device.clone(),
+            buffer: out,
+            len: numel_out,
+            dtype: q.dtype,
+        });
+    }
+
     let (spv, name) = pick_dt!(
         dt,
         (candle_vulkan_kernels::FA_VARLEN_F32, "fa_varlen_f32"),
@@ -1509,7 +1593,7 @@ pub fn flash_attn_varlen(
         name,
         &bindings,
         &pc,
-        groups,
+        (total_q.div_ceil(32).max(1) as u32, num_heads as u32, 1),
     )?;
     Ok(VulkanStorage {
         device: q.device.clone(),

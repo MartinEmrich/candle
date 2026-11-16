@@ -1,7 +1,7 @@
 // Validates the Vulkan flash-attention kernel against a pure-Rust reference
 // for variable-length batching, causal masking, sliding windows and ALiBi.
 
-use candle::{Device, Tensor};
+use candle::{DType, Device, Tensor};
 use candle_flash_attn_vulkan::{
     flash_attn_varlen_alibi_windowed, flash_attn_varlen_windowed,
 };
@@ -225,6 +225,54 @@ fn gqa_case(dev: &Device, lens: &[usize], h: usize, hk: usize, d: usize, scale: 
     println!("ok: {tag} (max_abs={max_abs:.2e})");
 }
 
+/// f16-storage variant of [`run_case`]: builds f32 data, computes the f32
+/// reference, casts q/k/v to f16 on device, runs the tiled f16 kernel and
+/// compares to the reference with an f16-appropriate tolerance.
+#[allow(clippy::too_many_arguments)]
+fn run_case_f16(
+    dev: &Device,
+    lens: &[usize],
+    h: usize,
+    d: usize,
+    scale: f32,
+    causal: bool,
+    window_left: Option<usize>,
+    window_right: Option<usize>,
+) {
+    let total_q: usize = lens.iter().sum();
+    let mut cu = vec![0u32];
+    for l in lens {
+        cu.push(*cu.last().unwrap() + *l as u32);
+    }
+    let n = total_q * h * d;
+    let mut gen = lcg(0x1234_5678);
+    let q: Vec<f32> = (0..n).map(|_| gen()).collect();
+    let k: Vec<f32> = (0..n).map(|_| gen()).collect();
+    let v: Vec<f32> = (0..n).map(|_| gen()).collect();
+
+    let ref_out = reference(&q, &k, &v, &cu, h, d, scale, causal, window_left, window_right, None);
+
+    let shape = (total_q, h, d);
+    let qt = Tensor::from_vec(q, shape, dev).unwrap().to_dtype(DType::F16).unwrap();
+    let kt = Tensor::from_vec(k, shape, dev).unwrap().to_dtype(DType::F16).unwrap();
+    let vt = Tensor::from_vec(v, shape, dev).unwrap().to_dtype(DType::F16).unwrap();
+    let cuq = Tensor::from_vec(cu.clone(), (cu.len(),), dev).unwrap();
+    let out = flash_attn_varlen_windowed(
+        &qt, &kt, &vt, &cuq, &cuq, total_q, total_q, scale, window_left, window_right,
+    )
+    .unwrap();
+    assert_eq!(out.dims().to_vec(), vec![total_q, h, d]);
+    assert_eq!(out.dtype(), DType::F16);
+    let got = out.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let mut max_abs = 0.0f32;
+    for (a, b) in ref_out.iter().zip(got.iter()) {
+        max_abs = max_abs.max((a - b).abs());
+    }
+    let tag = format!("f16 lens={lens:?} h={h} d={d} causal={causal}");
+    assert!(max_abs < 5e-3, "{tag}: max_abs={max_abs}");
+    println!("ok: {tag} (max_abs={max_abs:.2e})");
+}
+
 #[test]
 fn fa_matches_reference() {
     let dev = match Device::new_vulkan(0) {
@@ -255,4 +303,80 @@ fn fa_matches_reference() {
     gqa_case(&dev, &[4, 3], 4, 2, 8, scale, false);
     gqa_case(&dev, &[6, 5], 4, 2, 8, scale, true);
     gqa_case(&dev, &[5], 8, 2, 64, scale, true);
+    // cross the tiled kernel's BR (128 query rows) and BC (32 keys) boundaries
+    run_case(&dev, &[128], h, d, scale, true, None, Some(0), None);
+    run_case(&dev, &[129, 200], h, d, scale, false, None, None, None);
+    run_case(&dev, &[300], h, d, scale, true, None, Some(0), None);
+    run_case(&dev, &[64, 130, 257], h, d, scale, true, Some(2), Some(0), None);
+    // head_size = 128 (Qwen3 / MAX_D edge), crossing tiles
+    run_case(&dev, &[130, 200], h, 128, scale, true, None, Some(0), None);
+    // alibi across tile boundaries
+    run_case(&dev, &[140], h, d, scale, false, None, None, Some(vec![0.5, 0.125]));
+    // GQA across tile boundaries
+    gqa_case(&dev, &[130, 200], 4, 2, 64, scale, true);
+    // f16 storage path (TEI default dtype), crossing tiles
+    run_case_f16(&dev, &[3, 2], h, d, scale, false, None, None);
+    run_case_f16(&dev, &[129, 200], h, d, scale, true, None, Some(0));
+    run_case_f16(&dev, &[130, 200], h, 128, scale, true, None, Some(0));
+    run_case_f16(&dev, &[64, 130, 257], h, d, scale, true, Some(2), Some(0));
+}
+
+/// Long-sequence timing / no-fault check for the tiled kernel: two 8192-token
+/// sequences (the router warmup shape). The scalar kernel tripped the amdgpu job
+/// timeout here; the tiled kernel must complete quickly with finite output.
+#[test]
+fn fa_long_seq_perf() {
+    let dev = match Device::new_vulkan(0) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("no vulkan device; skipping");
+            return;
+        }
+    };
+    let h = std::env::var("FA_TEST_H").ok().and_then(|s| s.parse().ok()).unwrap_or(12usize);
+    let d = 64usize;
+    let scale = 1.0 / (d as f32).sqrt();
+    let seq = std::env::var("FA_TEST_SEQ").ok().and_then(|s| s.parse().ok()).unwrap_or(8192usize);
+    let nb = std::env::var("FA_TEST_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(2usize);
+    let lens = vec![seq; nb];
+    let lens = lens.as_slice();
+    let total: usize = lens.iter().sum();
+    let mut cu = vec![0u32];
+    for l in lens {
+        cu.push(*cu.last().unwrap() + *l as u32);
+    }
+    let n = total * h * d;
+    let mut gen = lcg(0xabcdef);
+    let q: Vec<f32> = (0..n).map(|_| gen()).collect();
+    let k: Vec<f32> = (0..n).map(|_| gen()).collect();
+    let v: Vec<f32> = (0..n).map(|_| gen()).collect();
+
+    let shape = (total, h, d);
+    let qt = Tensor::from_vec(q, shape, &dev).unwrap();
+    let kt = Tensor::from_vec(k, shape, &dev).unwrap();
+    let vt = Tensor::from_vec(v, shape, &dev).unwrap();
+    let cu_len = cu.len();
+    let cuq = Tensor::from_vec(cu, (cu_len,), &dev).unwrap();
+
+    let t0 = std::time::Instant::now();
+    let out = flash_attn_varlen_windowed(&qt, &kt, &vt, &cuq, &cuq, seq, seq, scale, None, None);
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            println!("fa_long_seq: total={total} h={h} d={d} FA-CALL-ERR after {:?}: {e}", t0.elapsed());
+            return;
+        }
+    };
+    if let Err(e) = dev.synchronize() {
+        println!("fa_long_seq: total={total} h={h} d={d} SYNC-ERR after {:?}: {e}", t0.elapsed());
+        return;
+    }
+    let dt = t0.elapsed();
+    let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let bad = got.iter().filter(|x| !x.is_finite()).count();
+    println!("fa_long_seq: total={total} h={h} d={d} took {dt:?} nonfinite={bad}");
+    assert_eq!(got.len(), n);
+    assert_eq!(bad, 0, "non-finite outputs");
+    // Tiled kernel must clear the ~15s scalar-kernel timeout with margin.
+    assert!(dt.as_secs() < 10, "tiled FA too slow: {dt:?}");
 }

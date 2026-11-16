@@ -17,6 +17,8 @@ struct FlashAttnVarLen {
     window_size_left: Option<usize>,
     window_size_right: Option<usize>,
     softcap: Option<f32>,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
 }
 
 fn vulkan_storage<'a>(s: &'a Storage, what: &str) -> Result<&'a VulkanStorage> {
@@ -77,6 +79,8 @@ impl CustomOp3 for FlashAttnVarLen {
             self.window_size_left,
             self.window_size_right,
             self.softcap,
+            self.max_seqlen_q,
+            self.max_seqlen_k,
         )?;
         Ok((out, q_l.shape().clone()))
     }
@@ -97,8 +101,8 @@ pub fn flash_attn_varlen_windowed(
     v: &Tensor,
     seqlens_q: &Tensor,
     seqlens_k: &Tensor,
-    _max_seqlen_q: usize,
-    _max_seqlen_k: usize,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
     softmax_scale: f32,
     window_size_left: Option<usize>,
     window_size_right: Option<usize>,
@@ -111,6 +115,8 @@ pub fn flash_attn_varlen_windowed(
         window_size_left,
         window_size_right,
         softcap: None,
+        max_seqlen_q,
+        max_seqlen_k,
     };
     let q = q.contiguous()?;
     let k = k.contiguous()?;
@@ -128,8 +134,8 @@ pub fn flash_attn_varlen_alibi_windowed_softcap(
     alibi_slopes: &Tensor,
     seqlens_q: &Tensor,
     seqlens_k: &Tensor,
-    _max_seqlen_q: usize,
-    _max_seqlen_k: usize,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
     softmax_scale: f32,
     window_size_left: Option<usize>,
     window_size_right: Option<usize>,
@@ -143,6 +149,8 @@ pub fn flash_attn_varlen_alibi_windowed_softcap(
         window_size_left,
         window_size_right,
         softcap,
+        max_seqlen_q,
+        max_seqlen_k,
     };
     let q = q.contiguous()?;
     let k = k.contiguous()?;
