@@ -1,0 +1,39 @@
+// Shared helpers for bf16-storage kernels. bf16 storage is packed as two 16-bit
+// values per u32 word, little-endian: the even element index lives in the low
+// half, the odd element in the high half (matches bf16_to_f32/f32_to_bf16).
+//
+// A bf16 value is an f32 with the low 16 mantissa bits zeroed, so unpack is a
+// left-shift by 16 + reinterpret; pack is round-to-nearest-even (with a NaN
+// guard). Compute is done in f32 registers, so this path runs on hardware
+// without bf16 ALUs (e.g. GCN4 / Polaris). Storage stays 16-bit in VRAM.
+//
+// BF16_LOAD(buf, e): read element e (element index) from a uint buffer of packed
+//   bf16, returning it as f32.
+// BF16_LOW(v): encode float v as bf16 in the low 16 bits (high 16 bits zeroed).
+//   Pair two adjacent values into a word as (BF16_LOW(odd) << 16) | BF16_LOW(even).
+
+#ifndef BF16_COMMON_GLSLH
+#define BF16_COMMON_GLSLH
+
+float bf16_bits_to_f32(uint h) {
+    return intBitsToFloat(int(h << 16u));
+}
+
+uint f32_to_bf16_bits(float v) {
+    uint x = floatBitsToUint(v);
+    // NaN must stay NaN (avoid the rounding turning a quiet NaN into a number).
+    if ((x & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (x >> 16u) | 0x0040u;
+    }
+    uint lsb = (x >> 16u) & 1u;
+    return (x + 0x7FFFu + lsb) >> 16u;
+}
+
+#define BF16_LOAD(buf, e) \
+    (bf16_bits_to_f32( \
+        (((e) & 1u) == 0u) ? ((buf)[(e) >> 1u] & 0xFFFFu) : ((buf)[(e) >> 1u] >> 16u) \
+    ))
+
+#define BF16_LOW(v) (f32_to_bf16_bits(v) & 0xFFFFu)
+
+#endif
