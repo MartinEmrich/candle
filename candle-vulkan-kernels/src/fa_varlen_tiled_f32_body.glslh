@@ -14,7 +14,9 @@
 //
 // q,k,v,o are contiguous [total, num_heads, head_size] (varlen packing).
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#include "fa_tiled_common.glslh"
+
+layout(local_size_x = FA_TILE_BR, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer Q { float data[]; } b_q;
 layout(set = 0, binding = 1) readonly buffer K { float data[]; } b_k;
@@ -44,9 +46,10 @@ layout(push_constant) uniform PushConstants {
     uint head_base;    // first head of this launch (heads are chunked host-side)
 } pc;
 
-const uint BR = 128u;
-const uint BC = 32u;
+const uint BR = FA_TILE_BR;
+const uint BC = FA_TILE_BC;
 const uint HEAD = uint(HEAD_SIZE);
+const float LOG2E = 1.4426950408889634;
 
 shared float ks[BC * HEAD_SIZE];
 shared float vs[BC * HEAD_SIZE];
@@ -153,10 +156,19 @@ void main() {
                 continue;
             }
             uint krow = (kt - kt0) * HEAD_SIZE;
-            float s = 0.0;
-            for (uint d = 0u; d < HEAD; ++d) {
-                s += qrow[d] * ks[krow + d];
+            // Split the QK dot into 4 accumulators to break the serial FMA
+            // dependency chain (HEAD is a compile-time multiple of 4).
+            float s0 = 0.0;
+            float s1 = 0.0;
+            float s2 = 0.0;
+            float s3 = 0.0;
+            for (uint d = 0u; d < HEAD; d += 4u) {
+                s0 += qrow[d] * ks[krow + d];
+                s1 += qrow[d + 1u] * ks[krow + d + 1u];
+                s2 += qrow[d + 2u] * ks[krow + d + 2u];
+                s3 += qrow[d + 3u] * ks[krow + d + 3u];
             }
+            float s = (s0 + s1) + (s2 + s3);
             s *= pc.scale;
             if (pc.softcap > 0.0) {
                 s = pc.softcap * tanh(s / pc.softcap);
@@ -165,8 +177,8 @@ void main() {
                 s += alibi_slope * float(int(q_pos) - int(kt));
             }
             float m_new = max(m, s);
-            float corr = exp(m - m_new);
-            float p = exp(s - m_new);
+            float corr = exp2((m - m_new) * LOG2E);
+            float p = exp2((s - m_new) * LOG2E);
             l = l * corr + p;
             for (uint d = 0u; d < HEAD; ++d) {
                 acc[d] = acc[d] * corr + p * vs[krow + d];

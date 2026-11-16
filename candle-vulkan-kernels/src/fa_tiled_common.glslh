@@ -1,0 +1,15 @@
+// Shared tunables for the tiled varlen flash-attention kernels.
+//
+// BR = query rows per workgroup (one row per thread, so also the workgroup's
+// local_size_x). BC = keys per shared-memory K/V tile. Larger BC means fewer
+// barriers / cooperative loads per unit work but more shared memory (lower
+// occupancy on GCN4's 64 KB LDS); smaller BC raises occupancy at the cost of
+// more synchronisation. Overridable per compilation via -D.
+
+#ifndef FA_TILE_BR
+#define FA_TILE_BR 128
+#endif
+
+#ifndef FA_TILE_BC
+#define FA_TILE_BC 32
+#endif
