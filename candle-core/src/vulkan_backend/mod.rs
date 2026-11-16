@@ -909,6 +909,9 @@ impl BackendStorage for VulkanStorage {
             return Err(not_yet("matmul(non-f32/f16)"));
         }
         let (b, m, n, k) = mnk;
+        if f16 && n % 2 == 1 {
+            return Err(not_yet("matmul_f16(odd n)"));
+        }
         let l_rank = l_layout.dims().len();
         let r_rank = r_layout.dims().len();
         if !(2..=4).contains(&l_rank) || l_rank != r_rank {
@@ -952,7 +955,7 @@ impl BackendStorage for VulkanStorage {
         let tn = n.div_ceil(64);
         let base_groups = tm * tn * b;
         const TARGET_WG: usize = 256;
-        if !f16 && base_groups < TARGET_WG && k >= 256 {
+        if base_groups < TARGET_WG && k >= 256 {
             let mut k_splits = (TARGET_WG + base_groups - 1) / base_groups;
             k_splits = k_splits.min(k / 16);
             let mut k_chunk = 0usize;
@@ -962,7 +965,8 @@ impl BackendStorage for VulkanStorage {
             }
             if k_splits >= 2 {
                 let split_stride = numel;
-                let partial = self.device.alloc(k_splits * split_stride, self.dtype)?;
+                // Partials stay f32 for both dtypes (accuracy of the K-split sum).
+                let partial = self.device.alloc(k_splits * split_stride, DType::F32)?;
                 let pc_sk = [
                     l_layout.start_offset() as u32,
                     r_layout.start_offset() as u32,
@@ -988,9 +992,14 @@ impl BackendStorage for VulkanStorage {
                     k_splits as u32,
                     split_stride as u32,
                 ];
+                let (sk_spv, sk_name) = if f16 {
+                    (candle_vulkan_kernels::MATMUL_F16_SPLITK, "matmul_f16_splitk")
+                } else {
+                    (candle_vulkan_kernels::MATMUL_F32_SPLITK, "matmul_f32_splitk")
+                };
                 self.device.inner.dispatch(
-                    candle_vulkan_kernels::MATMUL_F32_SPLITK,
-                    "matmul_f32_splitk",
+                    sk_spv,
+                    sk_name,
                     &[&self.buffer, &r.buffer, &partial],
                     &pc_sk,
                     (
@@ -1001,12 +1010,18 @@ impl BackendStorage for VulkanStorage {
                 )?;
                 let out = self.device.alloc(numel, self.dtype)?;
                 let pc_red = [numel as u32, k_splits as u32, split_stride as u32];
+                let (rd_spv, rd_name) = if f16 {
+                    (candle_vulkan_kernels::MATMUL_F16_REDUCE, "matmul_f16_reduce")
+                } else {
+                    (candle_vulkan_kernels::MATMUL_F32_REDUCE, "matmul_f32_reduce")
+                };
+                let red_work = if f16 { numel / 2 } else { numel };
                 self.device.inner.dispatch(
-                    candle_vulkan_kernels::MATMUL_F32_REDUCE,
-                    "matmul_f32_reduce",
+                    rd_spv,
+                    rd_name,
                     &[&partial, &out],
                     &pc_red,
-                    dispatch_groups(numel, 256),
+                    dispatch_groups(red_work, 256),
                 )?;
                 return Ok(Self {
                     device: self.device.clone(),
@@ -1044,9 +1059,6 @@ impl BackendStorage for VulkanStorage {
             (n.div_ceil(64)).min(65535) as u32,
             b as u32,
         );
-        if f16 && n % 2 == 1 {
-            return Err(not_yet("matmul_f16(odd n)"));
-        }
         let (spv, name) = if f16 {
             (candle_vulkan_kernels::MATMUL_F16, "matmul_f16")
         } else {

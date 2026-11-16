@@ -158,6 +158,20 @@ fn f16_matmul() {
 }
 
 #[test]
+fn f16_matmul_splitk() {
+    let Some(dev) = vulkan_device() else { return };
+    // Small M/N, large K (>=256) so the dispatch takes the split-K path.
+    let (m, k, n) = (32usize, 1024usize, 64usize);
+    let a: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.007).sin()).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.013).cos()).collect();
+    let av = f16_on(&dev, a.clone(), (m, k));
+    let bv = f16_on(&dev, b.clone(), (k, n));
+    let got = av.matmul(&bv).unwrap();
+    let want = f32_cpu(a, (m, k)).matmul(&f32_cpu(b, (k, n))).unwrap();
+    check(&got, &want, 0.05, "matmul_splitk");
+}
+
+#[test]
 fn f16_matmul_batched() {
     let Some(dev) = vulkan_device() else { return };
     let (b, m, k, n) = (4usize, 32usize, 64usize, 40usize);

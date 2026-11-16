@@ -101,6 +101,10 @@ pub const MATMUL_F32_SPLITK: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_splitk.spv"));
 pub const MATMUL_F32_REDUCE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32_reduce.spv"));
+pub const MATMUL_F16_SPLITK: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f16_splitk.spv"));
+pub const MATMUL_F16_REDUCE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f16_reduce.spv"));
 pub const U32_TO_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/u32_to_f32.spv"));
 pub const F32_TO_U32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_to_u32.spv"));
 pub const I64_TO_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/i64_to_f32.spv"));
