@@ -242,18 +242,29 @@ pub struct VulkanDeviceInner {
     pending: Mutex<Pending>,
     cache: Mutex<KernelCache>,
     pool: Mutex<MemoryPool>,
+    /// Byte budget for a deferred batch: once the buffers referenced by the
+    /// unsubmitted batch exceed this, the batch is flushed (submitted) so their
+    /// memory can be reclaimed once the GPU finishes. Bounds peak VRAM so a
+    /// large forward pass does not keep every intermediate alive at once.
+    flush_bytes: usize,
     ordinal: usize,
     name: String,
 }
 
 /// Max recorded ops per command buffer batch before an auto-flush.
-const FLUSH_OPS_THRESHOLD: usize = 4096;
+const FLUSH_OPS_THRESHOLD: usize = 512;
+
+/// Default deferred-batch byte budget, used when the device heap size is
+/// unknown. Overridable via `CANDLE_VULKAN_FLUSH_BYTES`.
+const DEFAULT_FLUSH_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Default)]
 struct Pending {
     cmd: Option<vk::CommandBuffer>,
     /// Buffers referenced by ops recorded into `cmd` (not yet submitted).
     keepalive: Vec<Arc<VulkanBuffer>>,
+    /// Total size (bytes) of `keepalive`.
+    pending_bytes: usize,
     /// Descriptor sets used by ops in `cmd`; returned to the cache only after
     /// the batch's fence signals.
     sets: Vec<(vk::DescriptorSet, usize)>,
@@ -261,6 +272,8 @@ struct Pending {
     /// Submitted-but-unfinished batches: (fence, cmd, keepalive, sets).
     /// The command buffer and buffers stay alive until the fence signals.
     inflight: Vec<(vk::Fence, vk::CommandBuffer, Vec<Arc<VulkanBuffer>>, Vec<(vk::DescriptorSet, usize)>)>,
+    /// Total size (bytes) of every inflight batch's keepalive buffers.
+    inflight_bytes: usize,
 }
 
 impl std::fmt::Debug for VulkanDeviceInner {
@@ -379,6 +392,30 @@ impl VulkanDeviceInner {
             idx
         };
 
+        // Deferred-batch byte budget: a fraction of the device-local heap, so a
+        // large forward pass flushes often enough to bound peak VRAM. Env
+        // override (bytes) wins; otherwise clamp heap/4 into [64MB, 1GB].
+        let flush_bytes = {
+            if let Some(v) = std::env::var("CANDLE_VULKAN_FLUSH_BYTES")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+            {
+                v.max(1024 * 1024)
+            } else {
+                let heap = if device_local_index != u32::MAX {
+                    let ty = &memory_properties.memory_types_as_slice()[device_local_index as usize];
+                    memory_properties.memory_heaps_as_slice()[ty.heap_index as usize].size as usize
+                } else {
+                    0
+                };
+                if heap == 0 {
+                    DEFAULT_FLUSH_BYTES
+                } else {
+                    (heap / 4).clamp(64 * 1024 * 1024, DEFAULT_FLUSH_BYTES)
+                }
+            }
+        };
+
         Ok(Self {
             instance,
             physical_device,
@@ -391,6 +428,7 @@ impl VulkanDeviceInner {
             pending: Mutex::new(Pending::default()),
             cache: Mutex::new(KernelCache::new()),
             pool: Mutex::new(MemoryPool::new(device_local_index)),
+            flush_bytes,
             ordinal,
             name,
         })
@@ -547,11 +585,17 @@ impl VulkanDeviceInner {
                 &[],
             );
         }
+        let add_bytes: usize = keepalive.iter().map(|b| b.size()).sum();
         p.keepalive.extend(keepalive);
+        p.pending_bytes += add_bytes;
         p.sets.extend(sets);
         p.ops += 1;
-        if p.ops >= FLUSH_OPS_THRESHOLD {
-            self.flush_locked(&mut p, false)?;
+        // Flush when the batch grows large in ops or bytes. If already-submitted
+        // work still holds a lot of memory, wait for it so total live VRAM stays
+        // bounded even when the GPU lags behind command recording.
+        if p.ops >= FLUSH_OPS_THRESHOLD || p.pending_bytes >= self.flush_bytes {
+            let wait = p.inflight_bytes >= self.flush_bytes;
+            self.flush_locked(&mut p, wait)?;
         }
         Ok(())
     }
@@ -577,12 +621,11 @@ impl VulkanDeviceInner {
                 }
                 return Err(device_err("queue_submit", res.unwrap_err()));
             }
-            p.inflight.push((
-                fence,
-                cmd,
-                std::mem::take(&mut p.keepalive),
-                std::mem::take(&mut p.sets),
-            ));
+            let moved_keepalive = std::mem::take(&mut p.keepalive);
+            let moved_sets = std::mem::take(&mut p.sets);
+            p.inflight_bytes += moved_keepalive.iter().map(|b| b.size()).sum::<usize>();
+            p.pending_bytes = 0;
+            p.inflight.push((fence, cmd, moved_keepalive, moved_sets));
             p.cmd = None;
             p.ops = 0;
         }
@@ -607,6 +650,9 @@ impl VulkanDeviceInner {
             };
             if done {
                 let (fence, cmd, keepalive, sets) = p.inflight.remove(i);
+                p.inflight_bytes = p
+                    .inflight_bytes
+                    .saturating_sub(keepalive.iter().map(|b| b.size()).sum::<usize>());
                 unsafe {
                     self.device.destroy_fence(fence, None);
                     self.device
