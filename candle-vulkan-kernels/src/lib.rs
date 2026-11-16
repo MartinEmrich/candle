@@ -154,5 +154,9 @@ pub const FA_VARLEN_TILED_F16_D64: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_tiled_f16_d64.spv"));
 pub const FA_VARLEN_TILED_F16_D128: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_tiled_f16_d128.spv"));
+pub const FA_VARLEN_TILED_BF16_D64: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_tiled_bf16_d64.spv"));
+pub const FA_VARLEN_TILED_BF16_D128: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_tiled_bf16_d128.spv"));
 pub const FA_VARLEN_F16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_f16.spv"));
 pub const FA_VARLEN_BF16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_varlen_bf16.spv"));

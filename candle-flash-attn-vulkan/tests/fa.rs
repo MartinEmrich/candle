@@ -273,6 +273,52 @@ fn run_case_f16(
     println!("ok: {tag} (max_abs={max_abs:.2e})");
 }
 
+/// bf16-storage variant of [`run_case`] (tolerance widened for bf16 precision).
+#[allow(clippy::too_many_arguments)]
+fn run_case_bf16(
+    dev: &Device,
+    lens: &[usize],
+    h: usize,
+    d: usize,
+    scale: f32,
+    causal: bool,
+    window_left: Option<usize>,
+    window_right: Option<usize>,
+) {
+    let total_q: usize = lens.iter().sum();
+    let mut cu = vec![0u32];
+    for l in lens {
+        cu.push(*cu.last().unwrap() + *l as u32);
+    }
+    let n = total_q * h * d;
+    let mut gen = lcg(0x1234_5678);
+    let q: Vec<f32> = (0..n).map(|_| gen()).collect();
+    let k: Vec<f32> = (0..n).map(|_| gen()).collect();
+    let v: Vec<f32> = (0..n).map(|_| gen()).collect();
+
+    let ref_out = reference(&q, &k, &v, &cu, h, d, scale, causal, window_left, window_right, None);
+
+    let shape = (total_q, h, d);
+    let qt = Tensor::from_vec(q, shape, dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let kt = Tensor::from_vec(k, shape, dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let vt = Tensor::from_vec(v, shape, dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let cuq = Tensor::from_vec(cu.clone(), (cu.len(),), dev).unwrap();
+    let out = flash_attn_varlen_windowed(
+        &qt, &kt, &vt, &cuq, &cuq, total_q, total_q, scale, window_left, window_right,
+    )
+    .unwrap();
+    assert_eq!(out.dims().to_vec(), vec![total_q, h, d]);
+    assert_eq!(out.dtype(), DType::BF16);
+    let got = out.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let mut max_abs = 0.0f32;
+    for (a, b) in ref_out.iter().zip(got.iter()) {
+        max_abs = max_abs.max((a - b).abs());
+    }
+    let tag = format!("bf16 lens={lens:?} h={h} d={d} causal={causal}");
+    assert!(max_abs < 0.1, "{tag}: max_abs={max_abs}");
+    println!("ok: {tag} (max_abs={max_abs:.2e})");
+}
+
 #[test]
 fn fa_matches_reference() {
     let dev = match Device::new_vulkan(0) {
@@ -319,6 +365,10 @@ fn fa_matches_reference() {
     run_case_f16(&dev, &[129, 200], h, d, scale, true, None, Some(0));
     run_case_f16(&dev, &[130, 200], h, 128, scale, true, None, Some(0));
     run_case_f16(&dev, &[64, 130, 257], h, d, scale, true, Some(2), Some(0));
+    // bf16 storage path, crossing tiles
+    run_case_bf16(&dev, &[3, 2], h, d, scale, false, None, None);
+    run_case_bf16(&dev, &[129, 200], h, d, scale, true, None, Some(0));
+    run_case_bf16(&dev, &[130, 200], h, 128, scale, true, None, Some(0));
 }
 
 /// Long-sequence timing / no-fault check for the tiled kernel: two 8192-token

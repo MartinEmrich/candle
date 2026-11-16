@@ -1521,6 +1521,14 @@ pub fn flash_attn_varlen(
             candle_vulkan_kernels::FA_VARLEN_TILED_F16_D128,
             "fa_varlen_tiled_f16_d128",
         )),
+        (DType::BF16, 64) => Some((
+            candle_vulkan_kernels::FA_VARLEN_TILED_BF16_D64,
+            "fa_varlen_tiled_bf16_d64",
+        )),
+        (DType::BF16, 128) => Some((
+            candle_vulkan_kernels::FA_VARLEN_TILED_BF16_D128,
+            "fa_varlen_tiled_bf16_d128",
+        )),
         _ => None,
     };
 
