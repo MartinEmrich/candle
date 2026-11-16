@@ -90,6 +90,7 @@ pub const F32_TO_BF16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_to_
 pub const BOOL_TO_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bool_to_f32.spv"));
 pub const COPY_F16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_f16.spv"));
 pub const COPY2D_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy2d_f32.spv"));
+pub const COPY2D_F16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy2d_f16.spv"));
 pub const INDEX_SELECT_F32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/index_select_f32.spv"));
 pub const INDEX_SELECT_F16: &[u8] =

@@ -570,10 +570,18 @@ impl BackendStorage for VulkanStorage {
                 dispatch_groups(numel, 256),
             ),
             _ => {
+                // No direct kernel: route float<->float conversions through f32
+                // (e.g. bf16 weights loaded for an f16 model).
+                let is_float = |d: DType| matches!(d, DType::F16 | DType::BF16 | DType::F32);
+                if is_float(self.dtype) && is_float(dtype) && dtype != DType::F32 {
+                    let mid = self.to_dtype(layout, DType::F32)?;
+                    let mid_layout = Layout::contiguous(layout.shape().clone());
+                    return mid.to_dtype(&mid_layout, dtype);
+                }
                 return Err(not_yet(&format!(
                     "to_dtype({:?} -> {:?})",
                     self.dtype, dtype
-                )))
+                )));
             }
         };
         self.device
@@ -1129,8 +1137,12 @@ impl BackendStorage for VulkanStorage {
         src_offset: usize,
         dst_offset: usize,
     ) -> Result<()> {
-        if self.dtype != DType::F32 {
-            return Err(not_yet("copy2d(non-f32)"));
+        let f16 = self.dtype == DType::F16;
+        if self.dtype != DType::F32 && !f16 {
+            return Err(not_yet("copy2d(non-f32/f16)"));
+        }
+        if f16 && (d2 % 2 == 1 || dst_offset % 2 == 1 || dst_stride1 % 2 == 1) {
+            return Err(not_yet("copy2d(f16: unaligned rows)"));
         }
         let pc = [
             src_offset as u32,
@@ -1140,14 +1152,16 @@ impl BackendStorage for VulkanStorage {
             src_stride1 as u32,
             dst_stride1 as u32,
         ];
-        let groups = dispatch_groups(d1 * d2, 256);
-        self.device.inner.dispatch(
-            candle_vulkan_kernels::COPY2D_F32,
-            "copy2d_f32",
-            &[&self.buffer, &dst.buffer],
-            &pc,
-            groups,
-        )
+        let n = d1 * d2;
+        let groups = dispatch_groups(if f16 { n / 2 } else { n }, 256);
+        let (spv, name) = if f16 {
+            (candle_vulkan_kernels::COPY2D_F16, "copy2d_f16")
+        } else {
+            (candle_vulkan_kernels::COPY2D_F32, "copy2d_f32")
+        };
+        self.device
+            .inner
+            .dispatch(spv, name, &[&self.buffer, &dst.buffer], &pc, groups)
     }
 
     fn avg_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self> {
