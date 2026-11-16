@@ -330,15 +330,17 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
-        if self.dtype != DType::F32 {
-            return Err(not_yet("affine(non-f32)"));
-        }
         let dims = layout.dims();
         let strides = layout.stride();
         if dims.len() > 4 {
             return Err(not_yet("affine(rank > 4)"));
         }
         let numel = layout.shape().elem_count();
+        let (spv, name, work) = match self.dtype {
+            DType::F32 => (candle_vulkan_kernels::AFFINE_F32, "affine_f32", numel),
+            DType::F16 => (candle_vulkan_kernels::AFFINE_F16, "affine_f16", numel.div_ceil(2)),
+            _ => return Err(not_yet("affine(non-f32/f16)")),
+        };
         let out = self.device.alloc(numel, self.dtype)?;
         let mut pc = [0u32; 14];
         pc[0] = layout.start_offset() as u32;
@@ -353,10 +355,10 @@ impl BackendStorage for VulkanStorage {
         for (i, s) in strides.iter().enumerate() {
             pc[10 + i] = *s as u32;
         }
-        let groups = dispatch_groups(numel, 256);
+        let groups = dispatch_groups(work, 256);
         self.device.inner.dispatch(
-            candle_vulkan_kernels::AFFINE_F32,
-            "affine_f32",
+            spv,
+            name,
             &[&self.buffer, &out],
             &pc,
             groups,
@@ -586,29 +588,31 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        let f16 = self.dtype == DType::F16;
+        if self.dtype != DType::F32 && !f16 {
             return Err(not_yet(B::NAME));
         }
+        let pick = |f32: &'static [u8], f16k: &'static [u8]| if f16 { f16k } else { f32 };
         let spv = match B::NAME {
-            "exp" => candle_vulkan_kernels::EXP_F32,
-            "log" => candle_vulkan_kernels::LOG_F32,
-            "sin" => candle_vulkan_kernels::SIN_F32,
-            "cos" => candle_vulkan_kernels::COS_F32,
-            "tanh" => candle_vulkan_kernels::TANH_F32,
-            "neg" => candle_vulkan_kernels::NEG_F32,
-            "recip" => candle_vulkan_kernels::RECIP_F32,
-            "sqr" => candle_vulkan_kernels::SQR_F32,
-            "sqrt" => candle_vulkan_kernels::SQRT_F32,
-            "abs" => candle_vulkan_kernels::ABS_F32,
-            "ceil" => candle_vulkan_kernels::CEIL_F32,
-            "floor" => candle_vulkan_kernels::FLOOR_F32,
-            "round" => candle_vulkan_kernels::ROUND_F32,
-            "relu" => candle_vulkan_kernels::RELU_F32,
-            "sign" => candle_vulkan_kernels::SIGN_F32,
-            "erf" => candle_vulkan_kernels::ERF_F32,
-            "gelu" => candle_vulkan_kernels::GELU_F32,
-            "gelu_erf" => candle_vulkan_kernels::GELU_ERF_F32,
-            "silu" => candle_vulkan_kernels::SILU_F32,
+            "exp" => pick(candle_vulkan_kernels::EXP_F32, candle_vulkan_kernels::EXP_F16),
+            "log" => pick(candle_vulkan_kernels::LOG_F32, candle_vulkan_kernels::LOG_F16),
+            "sin" => pick(candle_vulkan_kernels::SIN_F32, candle_vulkan_kernels::SIN_F16),
+            "cos" => pick(candle_vulkan_kernels::COS_F32, candle_vulkan_kernels::COS_F16),
+            "tanh" => pick(candle_vulkan_kernels::TANH_F32, candle_vulkan_kernels::TANH_F16),
+            "neg" => pick(candle_vulkan_kernels::NEG_F32, candle_vulkan_kernels::NEG_F16),
+            "recip" => pick(candle_vulkan_kernels::RECIP_F32, candle_vulkan_kernels::RECIP_F16),
+            "sqr" => pick(candle_vulkan_kernels::SQR_F32, candle_vulkan_kernels::SQR_F16),
+            "sqrt" => pick(candle_vulkan_kernels::SQRT_F32, candle_vulkan_kernels::SQRT_F16),
+            "abs" => pick(candle_vulkan_kernels::ABS_F32, candle_vulkan_kernels::ABS_F16),
+            "ceil" => pick(candle_vulkan_kernels::CEIL_F32, candle_vulkan_kernels::CEIL_F16),
+            "floor" => pick(candle_vulkan_kernels::FLOOR_F32, candle_vulkan_kernels::FLOOR_F16),
+            "round" => pick(candle_vulkan_kernels::ROUND_F32, candle_vulkan_kernels::ROUND_F16),
+            "relu" => pick(candle_vulkan_kernels::RELU_F32, candle_vulkan_kernels::RELU_F16),
+            "sign" => pick(candle_vulkan_kernels::SIGN_F32, candle_vulkan_kernels::SIGN_F16),
+            "erf" => pick(candle_vulkan_kernels::ERF_F32, candle_vulkan_kernels::ERF_F16),
+            "gelu" => pick(candle_vulkan_kernels::GELU_F32, candle_vulkan_kernels::GELU_F16),
+            "gelu_erf" => pick(candle_vulkan_kernels::GELU_ERF_F32, candle_vulkan_kernels::GELU_ERF_F16),
+            "silu" => pick(candle_vulkan_kernels::SILU_F32, candle_vulkan_kernels::SILU_F16),
             _ => return Err(not_yet(B::NAME)),
         };
         let dims = layout.dims();
@@ -628,7 +632,8 @@ impl BackendStorage for VulkanStorage {
         for (i, s) in layout.stride().iter().enumerate() {
             pc[8 + i] = *s as u32;
         }
-        let groups = dispatch_groups(numel, 256);
+        let work = if f16 { numel.div_ceil(2) } else { numel };
+        let groups = dispatch_groups(work, 256);
         self.device
             .inner
             .dispatch(spv, B::NAME, &[&self.buffer, &out], &pc, groups)?;
@@ -653,6 +658,12 @@ impl BackendStorage for VulkanStorage {
             ("div", DType::F32) => candle_vulkan_kernels::DIV_F32,
             ("minimum", DType::F32) => candle_vulkan_kernels::MINIMUM_F32,
             ("maximum", DType::F32) => candle_vulkan_kernels::MAXIMUM_F32,
+            ("add", DType::F16) => candle_vulkan_kernels::ADD_F16,
+            ("sub", DType::F16) => candle_vulkan_kernels::SUB_F16,
+            ("mul", DType::F16) => candle_vulkan_kernels::MUL_F16,
+            ("div", DType::F16) => candle_vulkan_kernels::DIV_F16,
+            ("minimum", DType::F16) => candle_vulkan_kernels::MINIMUM_F16,
+            ("maximum", DType::F16) => candle_vulkan_kernels::MAXIMUM_F16,
             ("add", DType::U32) => candle_vulkan_kernels::ADD_U32,
             ("sub", DType::U32) => candle_vulkan_kernels::SUB_U32,
             _ => return Err(not_yet(B::NAME)),
@@ -679,7 +690,8 @@ impl BackendStorage for VulkanStorage {
         for (i, s) in rhs_layout.stride().iter().enumerate() {
             pc[17 + i] = *s as u32;
         }
-        let groups = dispatch_groups(numel, 256);
+        let work = if self.dtype == DType::F16 { numel.div_ceil(2) } else { numel };
+        let groups = dispatch_groups(work, 256);
         self.device.inner.dispatch(
             spv,
             B::NAME,
@@ -794,8 +806,9 @@ impl BackendStorage for VulkanStorage {
         indexes_layout: &Layout,
         dim: usize,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 {
-            return Err(not_yet("index_select(non-f32)"));
+        let f16 = self.dtype == DType::F16;
+        if self.dtype != DType::F32 && !f16 {
+            return Err(not_yet("index_select(non-f32/f16)"));
         }
         let ids_stride = match indexes.dtype {
             DType::U32 => 1u32,
@@ -826,10 +839,16 @@ impl BackendStorage for VulkanStorage {
         pc[12] = indexes_layout.start_offset() as u32 * ids_stride;
         pc[13] = ids_stride;
         pc[14] = dim as u32;
-        let groups = dispatch_groups(numel, 256);
+        let work = if f16 { numel.div_ceil(2) } else { numel };
+        let groups = dispatch_groups(work, 256);
+        let (spv, name) = if f16 {
+            (candle_vulkan_kernels::INDEX_SELECT_F16, "index_select_f16")
+        } else {
+            (candle_vulkan_kernels::INDEX_SELECT_F32, "index_select_f32")
+        };
         self.device.inner.dispatch(
-            candle_vulkan_kernels::INDEX_SELECT_F32,
-            "index_select_f32",
+            spv,
+            name,
             &[&self.buffer, &indexes.buffer, &out],
             &pc,
             groups,
@@ -877,8 +896,9 @@ impl BackendStorage for VulkanStorage {
         l_layout: &Layout,
         r_layout: &Layout,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 || r.dtype != DType::F32 {
-            return Err(not_yet("matmul(non-f32)"));
+        let f16 = self.dtype == DType::F16;
+        if self.dtype != r.dtype || (self.dtype != DType::F32 && !f16) {
+            return Err(not_yet("matmul(non-f32/f16)"));
         }
         let (b, m, n, k) = mnk;
         let l_rank = l_layout.dims().len();
@@ -924,7 +944,7 @@ impl BackendStorage for VulkanStorage {
         let tn = n.div_ceil(64);
         let base_groups = tm * tn * b;
         const TARGET_WG: usize = 256;
-        if base_groups < TARGET_WG && k >= 256 {
+        if !f16 && base_groups < TARGET_WG && k >= 256 {
             let mut k_splits = (TARGET_WG + base_groups - 1) / base_groups;
             k_splits = k_splits.min(k / 16);
             let mut k_chunk = 0usize;
@@ -1016,9 +1036,17 @@ impl BackendStorage for VulkanStorage {
             (n.div_ceil(64)).min(65535) as u32,
             b as u32,
         );
+        if f16 && n % 2 == 1 {
+            return Err(not_yet("matmul_f16(odd n)"));
+        }
+        let (spv, name) = if f16 {
+            (candle_vulkan_kernels::MATMUL_F16, "matmul_f16")
+        } else {
+            (candle_vulkan_kernels::MATMUL_F32, "matmul_f32")
+        };
         self.device.inner.dispatch(
-            candle_vulkan_kernels::MATMUL_F32,
-            "matmul_f32",
+            spv,
+            name,
             &[&self.buffer, &r.buffer, &out],
             &pc,
             groups,
@@ -1318,8 +1346,9 @@ pub fn flash_attn_varlen(
     window_right: Option<usize>,
     softcap: Option<f32>,
 ) -> Result<VulkanStorage> {
-    if q.dtype != DType::F32 || k.dtype != DType::F32 || v.dtype != DType::F32 {
-        return Err(not_yet("flash_attn_varlen(non-f32)"));
+    let f16 = q.dtype == DType::F16;
+    if !(q.dtype == k.dtype && q.dtype == v.dtype && (q.dtype == DType::F32 || f16)) {
+        return Err(not_yet("flash_attn_varlen(non-f32/f16)"));
     }
     let qd = q_l.dims();
     let kd = k_l.dims();
@@ -1333,6 +1362,14 @@ pub fn flash_attn_varlen(
     }
     if head_size > 256 {
         return Err(crate::Error::msg("flash_attn_varlen: head_size > 256"));
+    }
+    if f16 {
+        if head_size % 2 == 1 {
+            return Err(crate::Error::msg("flash_attn_varlen: f16 needs even head_size"));
+        }
+        if alibi.is_some() {
+            return Err(not_yet("flash_attn_varlen(alibi + f16)"));
+        }
     }
     if num_heads % num_heads_k != 0 {
         return Err(crate::Error::msg("flash_attn_varlen: num_heads_k must divide num_heads"));
@@ -1355,7 +1392,7 @@ pub fn flash_attn_varlen(
     let _ = total_k;
 
     let numel_out = total_q * num_heads * head_size;
-    let out = q.device.alloc(numel_out, DType::F32)?;
+    let out = q.device.alloc(numel_out, q.dtype)?;
 
     let window_left_i: i32 = window_left.map(|w| w as i64).unwrap_or(-1).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     let window_right_i: i32 = window_right.map(|w| w as i64).unwrap_or(-1).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
@@ -1394,9 +1431,14 @@ pub fn flash_attn_varlen(
         alibi_buf,
     ];
     let groups = (total_q.div_ceil(32).max(1) as u32, num_heads as u32, 1);
+    let (spv, name) = if f16 {
+        (candle_vulkan_kernels::FA_VARLEN_F16, "fa_varlen_f16")
+    } else {
+        (candle_vulkan_kernels::FA_VARLEN_F32, "fa_varlen_f32")
+    };
     q.device.inner.dispatch(
-        candle_vulkan_kernels::FA_VARLEN_F32,
-        "fa_varlen_f32",
+        spv,
+        name,
         &bindings,
         &pc,
         groups,
@@ -1405,6 +1447,6 @@ pub fn flash_attn_varlen(
         device: q.device.clone(),
         buffer: out,
         len: numel_out,
-        dtype: DType::F32,
+        dtype: q.dtype,
     })
 }

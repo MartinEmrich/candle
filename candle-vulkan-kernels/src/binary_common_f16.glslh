@@ -1,0 +1,78 @@
+// Shared body for binary elementwise kernels (f16 storage, f32 compute).
+// Entry files must set: #version 450, then #define BIN_OP(a,b) <expr>,
+// then #include "binary_common_f16.glslh".
+//
+// Each thread handles one u32 word = two adjacent elements (even, odd), so the
+// packed output word is written once (no read-modify-write races). The final
+// odd element (odd numel) preserves the untouched high half. Output is
+// contiguous; both inputs use (dims, strides) decomposition for broadcasting and
+// arbitrary views. Offsets are in elements.
+
+#include "f16_common.glslh"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Lhs {
+    uint data[];
+} b_lhs;
+
+layout(set = 0, binding = 1) readonly buffer Rhs {
+    uint data[];
+} b_rhs;
+
+layout(set = 0, binding = 2) buffer Dst {
+    uint data[];
+} b_dst;
+
+layout(push_constant) uniform PushConstants {
+    uint lhs_offset;
+    uint rhs_offset;
+    uint dst_offset;
+    uint numel;
+    uint rank;
+    uint lhs_dims[4];
+    uint lhs_strides[4];
+    uint rhs_dims[4];
+    uint rhs_strides[4];
+} pc;
+
+uint global_index() {
+    uint idx = gl_GlobalInvocationID.x;
+    idx += gl_NumWorkGroups.x * gl_WorkGroupSize.x * gl_WorkGroupID.y;
+    idx += gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_WorkGroupSize.x * gl_WorkGroupID.z;
+    return idx;
+}
+
+uint decomp(uint idx, uint dims[4], uint strides[4], uint rank, uint offset) {
+    uint off = offset;
+    uint rem = idx;
+    for (int d = int(rank) - 1; d >= 0; --d) {
+        uint coord = rem % dims[d];
+        rem /= dims[d];
+        off += coord * strides[d];
+    }
+    return off;
+}
+
+void main() {
+    uint w = global_index();
+    uint i0 = w * 2u;
+    if (i0 >= pc.numel) {
+        return;
+    }
+    uint li0 = decomp(i0, pc.lhs_dims, pc.lhs_strides, pc.rank, pc.lhs_offset);
+    uint ri0 = decomp(i0, pc.rhs_dims, pc.rhs_strides, pc.rank, pc.rhs_offset);
+    float v0 = BIN_OP(F16_LOAD(b_lhs.data, li0), F16_LOAD(b_rhs.data, ri0));
+    uint lo = F16_LOW(v0);
+    if (i0 + 1u < pc.numel) {
+        uint li1 = decomp(i0 + 1u, pc.lhs_dims, pc.lhs_strides, pc.rank, pc.lhs_offset);
+        uint ri1 = decomp(i0 + 1u, pc.rhs_dims, pc.rhs_strides, pc.rank, pc.rhs_offset);
+        float v1 = BIN_OP(F16_LOAD(b_lhs.data, li1), F16_LOAD(b_rhs.data, ri1));
+        uint hi = F16_LOW(v1);
+        b_dst.data[(pc.dst_offset + i0) >> 1u] = (hi << 16u) | lo;
+    } else {
+        uint wi = (pc.dst_offset + i0) >> 1u;
+        uint prev = b_dst.data[wi];
+        b_dst.data[wi] = (prev & 0xFFFF0000u) | lo;
+    }
+}

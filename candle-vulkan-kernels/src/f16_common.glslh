@@ -1,0 +1,19 @@
+// Shared helpers for f16-storage kernels. f16 storage is packed as two 16-bit
+// values per u32 word, little-endian: the even element index lives in the low
+// half, the odd element in the high half (matches f16_to_f32/f32_to_f16).
+//
+// Compute is done in f32 registers (unpackHalf2x16 / packHalf2x16 are core GLSL
+// 450, no extension required), so this path runs on hardware without fp16 ALUs
+// (e.g. GCN4 / Polaris). Storage stays 16-bit in VRAM.
+//
+// F16_LOAD(buf, e): read element e (element index) from a uint buffer of packed
+//   f16, returning it as f32.
+// F16_LOW(v): encode float v as f16 in the low 16 bits (high 16 bits zeroed).
+//   Pair two adjacent values into a word as (F16_LOW(odd) << 16) | F16_LOW(even).
+
+#define F16_LOAD(buf, e) \
+    (unpackHalf2x16( \
+        (((e) & 1u) == 0u) ? ((buf)[(e) >> 1u] & 0xFFFFu) : ((buf)[(e) >> 1u] >> 16u) \
+    )[0])
+
+#define F16_LOW(v) (packHalf2x16(vec2((v), 0.0)) & 0xFFFFu)
