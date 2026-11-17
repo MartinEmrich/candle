@@ -251,6 +251,11 @@ pub struct VulkanDeviceInner {
     /// kernels may do native fp16 compute (fp32 accumulate) instead of
     /// dequantizing to fp32. Queried at device creation; false elsewhere.
     fp16_compute: bool,
+    /// Debug aid: when set (`CANDLE_VULKAN_DEBUG_FLUSH`), every recorded op is
+    /// immediately submitted and waited on, with the op label logged before and
+    /// after. The last "op=…" without a matching "done" localizes a hanging or
+    /// faulting dispatch. Off in production (no cost).
+    dbg_flush: bool,
     ordinal: usize,
     name: String,
 }
@@ -472,6 +477,20 @@ impl VulkanDeviceInner {
             }
         };
 
+        if std::env::var("CANDLE_VULKAN_INFO").is_ok() {
+            let heap = if device_local_index != u32::MAX {
+                let ty = &memory_properties.memory_types_as_slice()[device_local_index as usize];
+                memory_properties.memory_heaps_as_slice()[ty.heap_index as usize].size
+            } else {
+                0
+            };
+            eprintln!(
+                "[candle-vulkan]   device_local_heap={}MB flush_bytes={}MB",
+                heap / 1024 / 1024,
+                flush_bytes / 1024 / 1024
+            );
+        }
+
         Ok(Self {
             instance,
             physical_device,
@@ -486,6 +505,7 @@ impl VulkanDeviceInner {
             pool: Mutex::new(MemoryPool::new(device_local_index)),
             flush_bytes,
             fp16_compute,
+            dbg_flush: std::env::var("CANDLE_VULKAN_DEBUG_FLUSH").is_ok(),
             ordinal,
             name,
         })
@@ -605,6 +625,7 @@ impl VulkanDeviceInner {
     /// GPU work can never observe a destroyed buffer.
     fn record(
         &self,
+        label: &str,
         keepalive: Vec<Arc<VulkanBuffer>>,
         sets: Vec<(vk::DescriptorSet, usize)>,
         f: impl FnOnce(&ash::Device, vk::CommandBuffer),
@@ -657,7 +678,16 @@ impl VulkanDeviceInner {
         // Flush when the batch grows large in ops or bytes. If already-submitted
         // work still holds a lot of memory, wait for it so total live VRAM stays
         // bounded even when the GPU lags behind command recording.
-        if p.ops >= FLUSH_OPS_THRESHOLD || p.pending_bytes >= self.flush_bytes {
+        if self.dbg_flush {
+            eprintln!(
+                "[vulkan-dbg] op={label} ops={} pending={}MB inflight={}MB",
+                p.ops,
+                p.pending_bytes >> 20,
+                p.inflight_bytes >> 20
+            );
+            self.flush_locked(&mut p, true)?;
+            eprintln!("[vulkan-dbg] op={label} done");
+        } else if p.ops >= FLUSH_OPS_THRESHOLD || p.pending_bytes >= self.flush_bytes {
             let wait = p.inflight_bytes >= self.flush_bytes;
             self.flush_locked(&mut p, wait)?;
         }
@@ -742,7 +772,7 @@ impl VulkanDeviceInner {
 
     /// Record + submit + wait for a one-shot command (used for readbacks).
     pub fn submit(&self, record: impl FnOnce(&ash::Device, vk::CommandBuffer)) -> Result<()> {
-        self.record(vec![], vec![], record)?;
+        self.record("submit", vec![], vec![], record)?;
         self.flush(true)
     }
 
@@ -767,6 +797,7 @@ impl VulkanDeviceInner {
         let (src_buf, dst_buf) = (staging.buffer, dst.buffer);
         let len = data.len();
         self.record(
+            "copy_h2d",
             vec![staging.clone(), dst.clone()],
             vec![],
             move |d, cmd| unsafe {
@@ -823,6 +854,7 @@ impl VulkanDeviceInner {
         debug_assert_eq!(size % 4, 0);
         let buf = buffer.buffer;
         self.record(
+            "fill_buffer",
             vec![buffer.clone()],
             vec![],
             move |d, cmd| unsafe {
@@ -839,6 +871,7 @@ impl VulkanDeviceInner {
     ) -> Result<()> {
         let (src_buf, dst_buf) = (src.buffer, dst.buffer);
         self.record(
+            "copy_buffer",
             vec![src.clone(), dst.clone()],
             vec![],
             move |d, cmd| unsafe {
@@ -903,7 +936,7 @@ impl VulkanDeviceInner {
 
         let keepalive: Vec<Arc<VulkanBuffer>> = bindings.iter().map(|b| (*b).clone()).collect();
         let sets = vec![(set, bindings.len())];
-        self.record(keepalive, sets, move |d, cmd| unsafe {
+        self.record(name, keepalive, sets, move |d, cmd| unsafe {
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             d.cmd_bind_descriptor_sets(
                 cmd,

@@ -1540,6 +1540,11 @@ pub fn flash_attn_varlen(
         // heads first; only split query tiles if a single head still exceeds the
         // budget. Work per launch ~= x_tiles * BR * max_seqlen_k * h * 2 * head_size.
         const MAC_BUDGET: u64 = 45_000_000_000;
+        let mac_budget = std::env::var("CANDLE_VULKAN_FA_MAC_BUDGET")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(MAC_BUDGET);
         let msq = max_seqlen_q.clamp(1, total_q);
         let msk = max_seqlen_k.clamp(1, total_q);
         let x_tiles_total = msq.div_ceil(TILED_BR).max(1);
@@ -1548,20 +1553,21 @@ pub fn flash_attn_varlen(
             .saturating_mul(2)
             .saturating_mul(head_size as u64);
         let all_x_per_head = (x_tiles_total as u64).saturating_mul(per_tile_macs);
-        let (h_chunk, x_chunk) = if all_x_per_head <= MAC_BUDGET {
+        let (h_chunk, x_chunk) = if all_x_per_head <= mac_budget {
             let hc = if all_x_per_head == 0 {
                 num_heads
             } else {
-                (MAC_BUDGET / all_x_per_head).max(1).min(num_heads as u64) as usize
+                (mac_budget / all_x_per_head).max(1).min(num_heads as u64) as usize
             };
             (hc.max(1), x_tiles_total)
         } else {
-            let xc = (MAC_BUDGET / per_tile_macs.max(1))
+            let xc = (mac_budget / per_tile_macs.max(1))
                 .max(1)
                 .min(x_tiles_total as u64) as usize;
             (1, xc.max(1))
         };
 
+        let dbg_fa = std::env::var("CANDLE_VULKAN_DEBUG_FA").is_ok();
         let mut pc_t = pc.clone();
         pc_t.push(0); // head_base (index 16)
         for hb in (0..num_heads).step_by(h_chunk) {
@@ -1569,6 +1575,7 @@ pub fn flash_attn_varlen(
             pc_t[16] = hb as u32;
             for xb in (0..x_tiles_total).step_by(x_chunk) {
                 let xc = x_chunk.min(x_tiles_total - xb) as u32;
+                let t0 = std::time::Instant::now();
                 q.device.inner.dispatch(
                     spv,
                     name,
@@ -1576,6 +1583,14 @@ pub fn flash_attn_varlen(
                     &pc_t,
                     (xc, hc, batch as u32),
                 )?;
+                if dbg_fa {
+                    eprintln!(
+                        "[fa] {} msq={msq} msk={msk} heads={num_heads} hb={hb} hc={hc} xb={xb} xc={xc} batch={batch} mac_budget={mac_budget} launch_macs={} elapsed={:?}",
+                        name,
+                        (xc as u64).saturating_mul(hc as u64).saturating_mul(per_tile_macs).saturating_mul(batch as u64),
+                        t0.elapsed(),
+                    );
+                }
                 // Each chunk must be its own submission so it gets its own GPU
                 // job timeout (the amdgpu scheduler times out per submit, not per
                 // dispatch); otherwise coalesced chunks form one over-budget job.
