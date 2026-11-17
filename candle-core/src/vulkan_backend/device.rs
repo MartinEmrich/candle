@@ -247,6 +247,10 @@ pub struct VulkanDeviceInner {
     /// memory can be reclaimed once the GPU finishes. Bounds peak VRAM so a
     /// large forward pass does not keep every intermediate alive at once.
     flush_bytes: usize,
+    /// `shaderFloat16` and `storageBuffer16BitAccess` are both supported, so
+    /// kernels may do native fp16 compute (fp32 accumulate) instead of
+    /// dequantizing to fp32. Queried at device creation; false elsewhere.
+    fp16_compute: bool,
     ordinal: usize,
     name: String,
 }
@@ -354,6 +358,58 @@ impl VulkanDeviceInner {
         let memory_properties =
             unsafe { instance.instance.get_physical_device_memory_properties(physical_device) };
 
+        // Query 16-bit compute support (core Vulkan 1.1/1.2 feature structs).
+        // fp16 compute needs `shaderFloat16` (fp16 ALU ops) plus
+        // `storageBuffer16BitAccess` (16-bit storage buffer members). Read-only
+        // here; the fp16-compute kernels gate on `fp16_compute`.
+        let (shader_float16, storage_buffer16, uniform_storage16) = unsafe {
+            let mut fp16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+            let mut s16 = vk::PhysicalDevice16BitStorageFeatures::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut fp16)
+                .push_next(&mut s16);
+            instance
+                .instance
+                .get_physical_device_features2(physical_device, &mut f2);
+            drop(f2);
+            (
+                fp16.shader_float16 != 0,
+                s16.storage_buffer16_bit_access != 0,
+                s16.uniform_and_storage_buffer16_bit_access != 0,
+            )
+        };
+        let fp16_compute = shader_float16 && storage_buffer16;
+
+        if std::env::var("CANDLE_VULKAN_INFO").is_ok() {
+            let l = &props.limits;
+            let api = props.api_version;
+            eprintln!(
+                "[candle-vulkan] device={:?} type={} api={}.{}.{}\n\
+                 [candle-vulkan]   wg_size={}x{}x{} wg_count={}x{}x{} wg_invocations={} shared_mem={}B\n\
+                 [candle-vulkan]   fp16: shader_float16={} storage_buffer16={} uniform_storage16={} => fp16_compute={}\n\
+                 [candle-vulkan]   min_storage_buffer_offset_align={} granularity={}",
+                name,
+                props.device_type.as_raw(),
+                api >> 22,
+                (api >> 12) & 0x3FF,
+                api & 0xFFF,
+                l.max_compute_work_group_size[0],
+                l.max_compute_work_group_size[1],
+                l.max_compute_work_group_size[2],
+                l.max_compute_work_group_count[0],
+                l.max_compute_work_group_count[1],
+                l.max_compute_work_group_count[2],
+                l.max_compute_work_group_invocations,
+                l.max_compute_shared_memory_size,
+                shader_float16,
+                storage_buffer16,
+                uniform_storage16,
+                fp16_compute,
+                l.min_storage_buffer_offset_alignment,
+                l.buffer_image_granularity,
+            );
+        }
+
         let priority = [1.0f32];
         let queue_ci = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
@@ -429,6 +485,7 @@ impl VulkanDeviceInner {
             cache: Mutex::new(KernelCache::new()),
             pool: Mutex::new(MemoryPool::new(device_local_index)),
             flush_bytes,
+            fp16_compute,
             ordinal,
             name,
         })
@@ -444,6 +501,13 @@ impl VulkanDeviceInner {
 
     pub fn properties(&self) -> &vk::PhysicalDeviceProperties {
         &self.properties
+    }
+
+    /// Whether the device supports native fp16 compute (fp16 ALU + 16-bit
+    /// storage buffers). When true, matmul/FA may compute in fp16 (fp32
+    /// accumulate) instead of dequantizing every load to fp32.
+    pub fn fp16_compute(&self) -> bool {
+        self.fp16_compute
     }
 
     fn find_memory_type(&self, filter: u32, props: vk::MemoryPropertyFlags) -> Result<u32> {
