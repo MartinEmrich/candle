@@ -1,6 +1,7 @@
 use crate::vulkan_backend::cache::{push_bytes, KernelCache, MAX_BINDINGS};
 use crate::{Error, Result, VulkanError};
 use ash::vk;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 static INSTANCE: OnceLock<Arc<VulkanInstance>> = OnceLock::new();
@@ -256,6 +257,21 @@ pub struct VulkanDeviceInner {
     /// after. The last "op=…" without a matching "done" localizes a hanging or
     /// faulting dispatch. Off in production (no cost).
     dbg_flush: bool,
+    /// Measured flash-attention throughput (MAC/s), calibrated once on the
+    /// second tiled-FA call (the first compiles shaders, so it is skipped).
+    /// Drives the per-launch MAC budget so a single FA launch stays under the
+    /// device's GPU-job timeout on any device (fast devices keep a large budget,
+    /// slow iGPUs get short launches). `None` until calibrated.
+    fa_macs_per_sec: OnceLock<f64>,
+    /// Accumulated FA work (MACs) and wall-time (ns) used to calibrate
+    /// `fa_macs_per_sec`. A single call is too noisy (fixed submit/wait latency
+    /// dominates a small call), so we sum several calls' work and time and set
+    /// the throughput once enough work has accumulated.
+    fa_probe_macs: AtomicU64,
+    fa_probe_nanos: AtomicU64,
+    /// Number of tiled-FA calls made so far; used to skip the shader-compile
+    /// call when measuring `fa_macs_per_sec`.
+    fa_calls: AtomicUsize,
     ordinal: usize,
     name: String,
 }
@@ -266,6 +282,11 @@ const FLUSH_OPS_THRESHOLD: usize = 512;
 /// Default deferred-batch byte budget, used when the device heap size is
 /// unknown. Overridable via `CANDLE_VULKAN_FLUSH_BYTES`.
 const DEFAULT_FLUSH_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Minimum FA work (MACs) to accumulate before latching the throughput
+/// calibration. High enough that fixed submit/wait latency is amortized (a
+/// single small call would otherwise under-report throughput by several times).
+const FA_PROBE_MIN_MACS: u64 = 40_000_000_000;
 
 #[derive(Default)]
 struct Pending {
@@ -506,9 +527,46 @@ impl VulkanDeviceInner {
             flush_bytes,
             fp16_compute,
             dbg_flush: std::env::var("CANDLE_VULKAN_DEBUG_FLUSH").is_ok(),
+            fa_macs_per_sec: OnceLock::new(),
+            fa_probe_macs: AtomicU64::new(0),
+            fa_probe_nanos: AtomicU64::new(0),
+            fa_calls: AtomicUsize::new(0),
             ordinal,
             name,
         })
+    }
+
+    /// Measured flash-attention throughput in MAC/s, if calibrated. See
+    /// [`VulkanDeviceInner::fa_macs_per_sec`] field docs.
+    pub fn fa_macs_per_sec(&self) -> Option<f64> {
+        self.fa_macs_per_sec.get().copied()
+    }
+
+    /// Add one synchronous FA probe (work + wall-time) to the running total and,
+    /// once at least [`FA_PROBE_MIN_MACS`] of work has been measured, derive and
+    /// latch the throughput (first latch wins). Returns the newly latched value.
+    /// Accumulating across calls averages out the fixed submit/wait latency that
+    /// makes a single small call wildly under-report throughput.
+    pub fn accumulate_fa_probe(&self, macs: u64, nanos: u64) -> Option<f64> {
+        if self.fa_macs_per_sec.get().is_some() {
+            return None;
+        }
+        let total_macs = self.fa_probe_macs.fetch_add(macs, Ordering::Relaxed) + macs;
+        let total_nanos = self.fa_probe_nanos.fetch_add(nanos, Ordering::Relaxed) + nanos;
+        if total_macs < FA_PROBE_MIN_MACS || total_nanos == 0 {
+            return None;
+        }
+        let tput = total_macs as f64 / (total_nanos as f64 / 1e9);
+        if tput.is_finite() && tput > 0.0 {
+            let _ = self.fa_macs_per_sec.set(tput);
+            return self.fa_macs_per_sec.get().copied();
+        }
+        None
+    }
+
+    /// Increment and return the tiled-FA call counter (pre-increment value).
+    pub fn bump_fa_calls(&self) -> usize {
+        self.fa_calls.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn name(&self) -> &str {

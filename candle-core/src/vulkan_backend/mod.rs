@@ -1533,18 +1533,28 @@ pub fn flash_attn_varlen(
     };
 
     if let Some((spv, name)) = tiled {
-        // A single launch must finish under the amdgpu scheduler job timeout
-        // (~2s on Polaris, else the GPU is soft-recovered). Split the work into
-        // launches bounded by a MAC budget (~1.4s at the measured ~3.1e10 MAC/s).
-        // Prefer keeping all query tiles per launch (good occupancy) and split
-        // heads first; only split query tiles if a single head still exceeds the
-        // budget. Work per launch ~= x_tiles * BR * max_seqlen_k * h * 2 * head_size.
-        const MAC_BUDGET: u64 = 45_000_000_000;
+        // A single launch must finish under the GPU job timeout: the amdgpu
+        // scheduler soft-recovers past ~2s on Polaris, and i915 wedges the whole
+        // context when a job runs past its hangcheck (~10s), which strands every
+        // later request in WaitForFences. The safe per-launch MAC budget is the
+        // device's measured flash-attention throughput times a fixed target
+        // wall-time, so fast devices keep a large budget (few launches) while
+        // slow iGPUs get short launches. Throughput is calibrated on the second
+        // tiled call (the first compiles shaders). Env override wins for tuning.
+        const FA_TARGET_SECS: f64 = 1.45; // ~45e9 MAC at the RX580's ~3.1e10 MAC/s
+        const FA_PROBE_BUDGET: u64 = 4_000_000_000; // bounded first-call budget
+        const FA_BUDGET_MIN: u64 = 500_000_000;
+        const FA_BUDGET_MAX: u64 = 120_000_000_000;
+
+        let throughput = q.device.inner.fa_macs_per_sec();
+        let calibrated_budget = throughput
+            .map(|t| ((t * FA_TARGET_SECS) as u64).clamp(FA_BUDGET_MIN, FA_BUDGET_MAX));
         let mac_budget = std::env::var("CANDLE_VULKAN_FA_MAC_BUDGET")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(MAC_BUDGET);
+            .or(calibrated_budget)
+            .unwrap_or(FA_PROBE_BUDGET);
         let msq = max_seqlen_q.clamp(1, total_q);
         let msk = max_seqlen_k.clamp(1, total_q);
         let x_tiles_total = msq.div_ceil(TILED_BR).max(1);
@@ -1552,20 +1562,43 @@ pub fn flash_attn_varlen(
             .saturating_mul(msk as u64)
             .saturating_mul(2)
             .saturating_mul(head_size as u64);
-        let all_x_per_head = (x_tiles_total as u64).saturating_mul(per_tile_macs);
-        let (h_chunk, x_chunk) = if all_x_per_head <= mac_budget {
-            let hc = if all_x_per_head == 0 {
+        // A launch spans the whole batch (grid.z = batch), so its real work is
+        // per_tile * x_tiles * heads * batch. Budget against that batched work,
+        // otherwise a batched forward launches work = budget * batch (the bug
+        // that produced ~16s launches and wedged the context).
+        let batch_u = batch.max(1) as u64;
+        let all_x_batched = (x_tiles_total as u64)
+            .saturating_mul(per_tile_macs)
+            .saturating_mul(batch_u);
+        let per_tile_batched = per_tile_macs.saturating_mul(batch_u);
+        let (h_chunk, x_chunk) = if all_x_batched <= mac_budget {
+            let hc = if all_x_batched == 0 {
                 num_heads
             } else {
-                (mac_budget / all_x_per_head).max(1).min(num_heads as u64) as usize
+                (mac_budget / all_x_batched).max(1).min(num_heads as u64) as usize
             };
             (hc.max(1), x_tiles_total)
         } else {
-            let xc = (mac_budget / per_tile_macs.max(1))
+            let xc = (mac_budget / per_tile_batched.max(1))
                 .max(1)
                 .min(x_tiles_total as u64) as usize;
             (1, xc.max(1))
         };
+
+        // Calibrate throughput before the budget is known: skip the first tiled
+        // call (it compiles shaders, inflating its wall-time) and accumulate
+        // synchronous probes until enough work is measured. Drain all preceding
+        // work first so the timed window covers only these FA launches:
+        // flush(true) waits for the whole pending batch (including the forward's
+        // matmuls queued before attention), so timing without draining would
+        // divide FA MACs by FA+matmul time and wildly under-report throughput.
+        let call_idx = q.device.inner.bump_fa_calls();
+        let measuring = throughput.is_none() && call_idx >= 1;
+        if measuring {
+            q.device.inner.flush(true)?;
+        }
+        let t_all = std::time::Instant::now();
+        let mut total_launch_macs = 0u64;
 
         let dbg_fa = std::env::var("CANDLE_VULKAN_DEBUG_FA").is_ok();
         let mut pc_t = pc.clone();
@@ -1583,11 +1616,15 @@ pub fn flash_attn_varlen(
                     &pc_t,
                     (xc, hc, batch as u32),
                 )?;
+                let launch_macs = (xc as u64)
+                    .saturating_mul(hc as u64)
+                    .saturating_mul(per_tile_macs)
+                    .saturating_mul(batch_u);
+                total_launch_macs = total_launch_macs.saturating_add(launch_macs);
                 if dbg_fa {
                     eprintln!(
-                        "[fa] {} msq={msq} msk={msk} heads={num_heads} hb={hb} hc={hc} xb={xb} xc={xc} batch={batch} mac_budget={mac_budget} launch_macs={} elapsed={:?}",
+                        "[fa] {} msq={msq} msk={msk} heads={num_heads} hb={hb} hc={hc} xb={xb} xc={xc} batch={batch} mac_budget={mac_budget} launch_macs={launch_macs} elapsed={:?}",
                         name,
-                        (xc as u64).saturating_mul(hc as u64).saturating_mul(per_tile_macs).saturating_mul(batch as u64),
                         t0.elapsed(),
                     );
                 }
@@ -1595,6 +1632,20 @@ pub fn flash_attn_varlen(
                 // job timeout (the amdgpu scheduler times out per submit, not per
                 // dispatch); otherwise coalesced chunks form one over-budget job.
                 q.device.inner.flush(false)?;
+            }
+        }
+        if measuring {
+            q.device.inner.flush(true)?;
+            let nanos = t_all.elapsed().as_nanos() as u64;
+            // Accumulate across calls; latches once enough work is measured
+            // (see `accumulate_fa_probe`). Returns Some only on the latching call.
+            if let Some(tput) = q.device.inner.accumulate_fa_probe(total_launch_macs, nanos) {
+                if dbg_fa {
+                    eprintln!(
+                        "[fa] calibrated throughput={tput:.3e} MAC/s -> budget={}",
+                        ((tput * FA_TARGET_SECS) as u64).clamp(FA_BUDGET_MIN, FA_BUDGET_MAX)
+                    );
+                }
             }
         }
         return Ok(VulkanStorage {
