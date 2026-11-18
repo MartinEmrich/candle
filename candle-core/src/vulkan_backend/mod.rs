@@ -1531,8 +1531,24 @@ pub fn flash_attn_varlen(
         )),
         _ => None,
     };
+    // Native-fp16-compute variant of the f16 tiled kernel, available only for
+    // f16 d64/d128 on devices that report the fp16 ALU. Chosen over the
+    // f32-compute kernel only when a one-time benchmark shows it is faster, so
+    // fp16-at-fp32-rate parts keep the (more precise) f32 path and fp16-less
+    // parts (GCN4 / Polaris) never see it.
+    let f16c: Option<(&[u8], &'static str)> = match (dt, head_size) {
+        (DType::F16, 64) if q.device.inner.fp16_compute() => Some((
+            candle_vulkan_kernels::FA_VARLEN_TILED_F16C_D64,
+            "fa_varlen_tiled_f16c_d64",
+        )),
+        (DType::F16, 128) if q.device.inner.fp16_compute() => Some((
+            candle_vulkan_kernels::FA_VARLEN_TILED_F16C_D128,
+            "fa_varlen_tiled_f16c_d128",
+        )),
+        _ => None,
+    };
 
-    if let Some((spv, name)) = tiled {
+    if let Some((spv_f32, name_f32)) = tiled {
         // A single launch must finish under the GPU job timeout: the amdgpu
         // scheduler soft-recovers past ~2s on Polaris, and i915 wedges the whole
         // context when a job runs past its hangcheck (~10s), which strands every
@@ -1585,55 +1601,129 @@ pub fn flash_attn_varlen(
             (1, xc.max(1))
         };
 
-        // Calibrate throughput before the budget is known: skip the first tiled
-        // call (it compiles shaders, inflating its wall-time) and accumulate
-        // synchronous probes until enough work is measured. Drain all preceding
-        // work first so the timed window covers only these FA launches:
-        // flush(true) waits for the whole pending batch (including the forward's
-        // matmuls queued before attention), so timing without draining would
-        // divide FA MACs by FA+matmul time and wildly under-report throughput.
+        let dbg_fa = std::env::var("CANDLE_VULKAN_DEBUG_FA").is_ok();
+        let mut pc_t = pc.clone();
+        pc_t.push(0); // head_base (index 16)
+
+        // Launch the tiled kernel (spv, name) writing into `obuf`, chunked so each
+        // submission stays under the per-launch budget; returns the MACs launched.
+        // Each chunk is its own submission so it gets its own GPU job timeout (the
+        // amdgpu scheduler times out per submit, not per dispatch); otherwise
+        // coalesced chunks would form one over-budget job that wedges the context.
+        let mut run = |spv: &[u8], name: &'static str, obuf: &Arc<VulkanBuffer>| -> Result<u64> {
+            let bindings = [
+                &q.buffer,
+                &k.buffer,
+                &v.buffer,
+                obuf,
+                &seqlens_q.buffer,
+                &seqlens_k.buffer,
+                alibi_buf,
+            ];
+            let mut total = 0u64;
+            for hb in (0..num_heads).step_by(h_chunk) {
+                let hc = h_chunk.min(num_heads - hb) as u32;
+                pc_t[16] = hb as u32;
+                for xb in (0..x_tiles_total).step_by(x_chunk) {
+                    let xc = x_chunk.min(x_tiles_total - xb) as u32;
+                    let t0 = std::time::Instant::now();
+                    q.device.inner.dispatch(
+                        spv,
+                        name,
+                        &bindings,
+                        &pc_t,
+                        (xc, hc, batch as u32),
+                    )?;
+                    let launch_macs = (xc as u64)
+                        .saturating_mul(hc as u64)
+                        .saturating_mul(per_tile_macs)
+                        .saturating_mul(batch_u);
+                    total = total.saturating_add(launch_macs);
+                    if dbg_fa {
+                        eprintln!(
+                            "[fa] {name} msq={msq} msk={msk} heads={num_heads} hb={hb} hc={hc} xb={xb} xc={xc} batch={batch} mac_budget={mac_budget} launch_macs={launch_macs} elapsed={:?}",
+                            t0.elapsed(),
+                        );
+                    }
+                    q.device.inner.flush(false)?;
+                }
+            }
+            Ok(total)
+        };
+
+        // Decide the f16 compute mode (native fp16 vs f32) once per device.
+        // CANDLE_VULKAN_FA_COMPUTE=f16|f32 forces a choice; otherwise reuse the
+        // latched decision, and if undecided benchmark both kernels on the real
+        // tensors (after a warm-up that compiles both) and latch the faster. The
+        // first call is skipped so a shader-compile never skews the comparison.
         let call_idx = q.device.inner.bump_fa_calls();
+        let mut use_f16: bool = match std::env::var("CANDLE_VULKAN_FA_COMPUTE")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("f16") => f16c.is_some(),
+            Some("f32") => false,
+            _ => match q.device.inner.fa_f16_compute() {
+                Some(d) => d,
+                None if f16c.is_some() && call_idx >= 1 => {
+                    let (spv_f16, name_f16) = f16c.unwrap();
+                    let s1 = q.device.alloc(numel_out, q.dtype)?;
+                    let s2 = q.device.alloc(numel_out, q.dtype)?;
+                    // Warm / compile both kernels so timing excludes compilation.
+                    run(spv_f32, name_f32, &s1)?;
+                    run(spv_f16, name_f16, &s2)?;
+                    q.device.inner.flush(true)?;
+                    // Interleaved timed reps, keeping the fastest of each (the
+                    // min is robust to scheduling spikes; interleaving cancels
+                    // slow drift across the loop). The first calls run during
+                    // warm-up, which is noisy, so min-of-3 matters.
+                    let mut best_f32 = u64::MAX;
+                    let mut best_f16 = u64::MAX;
+                    for _ in 0..3 {
+                        let t = std::time::Instant::now();
+                        run(spv_f32, name_f32, &s1)?;
+                        q.device.inner.flush(true)?;
+                        best_f32 = best_f32.min(t.elapsed().as_nanos() as u64);
+                        let t = std::time::Instant::now();
+                        run(spv_f16, name_f16, &s2)?;
+                        q.device.inner.flush(true)?;
+                        best_f16 = best_f16.min(t.elapsed().as_nanos() as u64);
+                    }
+                    let (d_f32, d_f16) = (best_f32, best_f16);
+                    // Require fp16 to be >2% faster to switch: keep the more
+                    // precise f32 path on ties and avoid flipping on noise.
+                    let chosen = d_f16 * 50 < d_f32 * 49;
+                    let _ = q.device.inner.set_fa_f16_compute(chosen);
+                    if dbg_fa {
+                        eprintln!(
+                            "[fa] f16c-bench f32={d_f32}ns f16={d_f16}ns -> {}",
+                            if chosen { "f16" } else { "f32" }
+                        );
+                    }
+                    chosen
+                }
+                None => false,
+            },
+        };
+        // Never select the fp16 kernel when this call has no fp16 variant (the
+        // latched decision is device-wide; only f16 d64/d128 have one).
+        use_f16 &= f16c.is_some();
+        let (spv, name) = if use_f16 { f16c.unwrap() } else { (spv_f32, name_f32) };
+
+        // Calibrate throughput on the chosen kernel: skip the first tiled call
+        // (it compiles shaders, inflating wall-time) and accumulate synchronous
+        // probes until enough work is measured. Drain all preceding work first so
+        // the timed window covers only these FA launches: flush(true) waits for
+        // the whole pending batch (including the forward's matmuls queued before
+        // attention), so timing without draining would divide FA MACs by
+        // FA+matmul time and wildly under-report throughput.
         let measuring = throughput.is_none() && call_idx >= 1;
         if measuring {
             q.device.inner.flush(true)?;
         }
         let t_all = std::time::Instant::now();
-        let mut total_launch_macs = 0u64;
-
-        let dbg_fa = std::env::var("CANDLE_VULKAN_DEBUG_FA").is_ok();
-        let mut pc_t = pc.clone();
-        pc_t.push(0); // head_base (index 16)
-        for hb in (0..num_heads).step_by(h_chunk) {
-            let hc = h_chunk.min(num_heads - hb) as u32;
-            pc_t[16] = hb as u32;
-            for xb in (0..x_tiles_total).step_by(x_chunk) {
-                let xc = x_chunk.min(x_tiles_total - xb) as u32;
-                let t0 = std::time::Instant::now();
-                q.device.inner.dispatch(
-                    spv,
-                    name,
-                    &bindings,
-                    &pc_t,
-                    (xc, hc, batch as u32),
-                )?;
-                let launch_macs = (xc as u64)
-                    .saturating_mul(hc as u64)
-                    .saturating_mul(per_tile_macs)
-                    .saturating_mul(batch_u);
-                total_launch_macs = total_launch_macs.saturating_add(launch_macs);
-                if dbg_fa {
-                    eprintln!(
-                        "[fa] {} msq={msq} msk={msk} heads={num_heads} hb={hb} hc={hc} xb={xb} xc={xc} batch={batch} mac_budget={mac_budget} launch_macs={launch_macs} elapsed={:?}",
-                        name,
-                        t0.elapsed(),
-                    );
-                }
-                // Each chunk must be its own submission so it gets its own GPU
-                // job timeout (the amdgpu scheduler times out per submit, not per
-                // dispatch); otherwise coalesced chunks form one over-budget job.
-                q.device.inner.flush(false)?;
-            }
-        }
+        let total_launch_macs = run(spv, name, &out)?;
         if measuring {
             q.device.inner.flush(true)?;
             let nanos = t_all.elapsed().as_nanos() as u64;

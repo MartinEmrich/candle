@@ -272,6 +272,12 @@ pub struct VulkanDeviceInner {
     /// Number of tiled-FA calls made so far; used to skip the shader-compile
     /// call when measuring `fa_macs_per_sec`.
     fa_calls: AtomicUsize,
+    /// Whether the native-fp16 flash-attention kernel beats the f32-compute one
+    /// on this device, decided by a one-time benchmark on the second f16 FA call
+    /// (the first compiles shaders). `None` until decided; `false` (f32 compute)
+    /// is the safe default. Only ever `true` when the device reports
+    /// `fp16_compute`, so fp16-ALU-less parts (GCN4/Polaris) are unaffected.
+    fa_f16_compute: OnceLock<bool>,
     ordinal: usize,
     name: String,
 }
@@ -440,10 +446,24 @@ impl VulkanDeviceInner {
         let queue_ci = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priority);
-        let features = vk::PhysicalDeviceFeatures::default();
-        let device_ci = vk::DeviceCreateInfo::default()
-            .queue_create_infos(std::slice::from_ref(&queue_ci))
-            .enabled_features(&features);
+        // Enable `shaderFloat16` when the device supports it so kernels may use
+        // the native fp16 ALUs (the fp16-compute FA variant needs it). 1.1+
+        // features must ride a PhysicalDeviceFeatures2 pNext chain; the v1
+        // `enabled_features` path cannot express them. Devices without fp16 keep
+        // the plain default-feature path untouched.
+        let mut fp16_features =
+            vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
+        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut fp16_features);
+        let base_features = vk::PhysicalDeviceFeatures::default();
+        let device_ci = if shader_float16 {
+            vk::DeviceCreateInfo::default()
+                .queue_create_infos(std::slice::from_ref(&queue_ci))
+                .push_next(&mut features2)
+        } else {
+            vk::DeviceCreateInfo::default()
+                .queue_create_infos(std::slice::from_ref(&queue_ci))
+                .enabled_features(&base_features)
+        };
         let device = unsafe {
             instance
                 .instance
@@ -531,6 +551,7 @@ impl VulkanDeviceInner {
             fa_probe_macs: AtomicU64::new(0),
             fa_probe_nanos: AtomicU64::new(0),
             fa_calls: AtomicUsize::new(0),
+            fa_f16_compute: OnceLock::new(),
             ordinal,
             name,
         })
@@ -567,6 +588,20 @@ impl VulkanDeviceInner {
     /// Increment and return the tiled-FA call counter (pre-increment value).
     pub fn bump_fa_calls(&self) -> usize {
         self.fa_calls.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Current native-fp16 FA decision: `Some(true)` use the fp16-compute
+    /// kernel, `Some(false)` use the f32-compute kernel, `None` undecided (the
+    /// caller should benchmark). See the `fa_f16_compute` field docs.
+    pub fn fa_f16_compute(&self) -> Option<bool> {
+        self.fa_f16_compute.get().copied()
+    }
+
+    /// Latch the native-fp16 FA decision (first writer wins). Returns the
+    /// effective value, so a concurrent first decider stays consistent.
+    pub fn set_fa_f16_compute(&self, use_f16: bool) -> bool {
+        let _ = self.fa_f16_compute.set(use_f16);
+        self.fa_f16_compute.get().copied().unwrap_or(false)
     }
 
     pub fn name(&self) -> &str {
