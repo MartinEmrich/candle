@@ -278,6 +278,14 @@ pub struct VulkanDeviceInner {
     /// is the safe default. Only ever `true` when the device reports
     /// `fp16_compute`, so fp16-ALU-less parts (GCN4/Polaris) are unaffected.
     fa_f16_compute: OnceLock<bool>,
+    /// Native-fp16 matmul decision (see `matmul_f16_compute()`). Decided by a
+    /// one-time benchmark on synthetic GEMMs, triggered on the first matmul call
+    /// (which happens during startup warmup). `None` until decided; `false` (f32
+    /// compute) is the safe default. Only ever `true` when the device reports
+    /// `fp16_compute`, so fp16-ALU-less parts (GCN4/Polaris) are unaffected.
+    matmul_f16_compute: OnceLock<bool>,
+    /// Number of matmul dispatches so far; the first one triggers the benchmark.
+    matmul_calls: AtomicUsize,
     ordinal: usize,
     name: String,
 }
@@ -552,6 +560,8 @@ impl VulkanDeviceInner {
             fa_probe_nanos: AtomicU64::new(0),
             fa_calls: AtomicUsize::new(0),
             fa_f16_compute: OnceLock::new(),
+            matmul_f16_compute: OnceLock::new(),
+            matmul_calls: AtomicUsize::new(0),
             ordinal,
             name,
         })
@@ -602,6 +612,26 @@ impl VulkanDeviceInner {
     pub fn set_fa_f16_compute(&self, use_f16: bool) -> bool {
         let _ = self.fa_f16_compute.set(use_f16);
         self.fa_f16_compute.get().copied().unwrap_or(false)
+    }
+
+    /// Increment and return the matmul call counter (pre-increment value). The
+    /// first call (value 0) triggers the f16-vs-f32 benchmark.
+    pub fn bump_matmul_calls(&self) -> usize {
+        self.matmul_calls.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Current native-fp16 matmul decision: `Some(true)` use the fp16-compute
+    /// kernel, `Some(false)` use the f32-compute kernel, `None` undecided (the
+    /// caller should benchmark). See the `matmul_f16_compute` field docs.
+    pub fn matmul_f16_compute(&self) -> Option<bool> {
+        self.matmul_f16_compute.get().copied()
+    }
+
+    /// Latch the native-fp16 matmul decision (first writer wins). Returns the
+    /// effective value, so a concurrent first decider stays consistent.
+    pub fn set_matmul_f16_compute(&self, use_f16: bool) -> bool {
+        let _ = self.matmul_f16_compute.set(use_f16);
+        self.matmul_f16_compute.get().copied().unwrap_or(false)
     }
 
     pub fn name(&self) -> &str {

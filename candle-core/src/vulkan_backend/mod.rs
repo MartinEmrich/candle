@@ -273,6 +273,99 @@ impl VulkanStorage {
             dtype,
         })
     }
+
+    /// Decide (once per device) whether f16 matmuls use the native-fp16 compute
+    /// kernels. `false` unless the dtype is f16 and the device reports
+    /// `fp16_compute`, so fp16-ALU-less parts (GCN4/Polaris) never see it. The
+    /// decision is a device property (its fp16-vs-fp32 ALU ratio), so it is latched
+    /// once — benchmarked on a synthetic GEMM on the second f16 matmul (the first
+    /// compiles shaders). `CANDLE_VULKAN_MATMUL_COMPUTE=f16|f32` forces a choice.
+    fn matmul_select_f16c(&self, dt: DType) -> Result<bool> {
+        if dt != DType::F16 || !self.device.inner.fp16_compute() {
+            return Ok(false);
+        }
+        let call_idx = self.device.inner.bump_matmul_calls();
+        Ok(
+            match std::env::var("CANDLE_VULKAN_MATMUL_COMPUTE")
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("f16") => true,
+                Some("f32") => false,
+                _ => match self.device.inner.matmul_f16_compute() {
+                    Some(d) => d,
+                    None if call_idx >= 1 => self.benchmark_matmul_f16c()?,
+                    None => false,
+                },
+            },
+        )
+    }
+
+    /// Benchmark the f32-compute (`matmul_f16`) and native-fp16 (`matmul_f16c`)
+    /// base kernels on a representative compute-bound GEMM and latch the faster.
+    /// `m, n, k` are push constants, so this exercises the same kernels the model
+    /// dispatches; only the device's fp16-vs-fp32 ALU rate varies. Warm both (so
+    /// shader compilation is excluded), then min-of-3 interleaved reps; require
+    /// fp16 to be >2% faster to switch (keep f32 on ties / noise).
+    fn benchmark_matmul_f16c(&self) -> Result<bool> {
+        let (m, n, k) = (512usize, 1024usize, 1024usize);
+        let lhs = self.device.alloc(m * k, DType::F16)?;
+        let rhs = self.device.alloc(k * n, DType::F16)?;
+        let out = self.device.alloc(m * n, DType::F16)?;
+        // Base-kernel push block: contiguous lhs[m,k], rhs[k,n], out[m,n], batch 1.
+        let pc = [
+            0u32,
+            0,
+            0,
+            m as u32,
+            n as u32,
+            k as u32,
+            0,
+            0,
+            k as u32,
+            1,
+            0,
+            0,
+            n as u32,
+            1,
+            (m * n) as u32,
+            1,
+        ];
+        let grid = (
+            m.div_ceil(64).min(65535) as u32,
+            n.div_ceil(64).min(65535) as u32,
+            1u32,
+        );
+        let bindings = [&lhs, &rhs, &out];
+        let run = |spv: &[u8], name: &'static str| -> Result<()> {
+            self.device.inner.dispatch(spv, name, &bindings, &pc, grid)
+        };
+        run(candle_vulkan_kernels::MATMUL_F16, "matmul_f16")?;
+        run(candle_vulkan_kernels::MATMUL_F16C, "matmul_f16c")?;
+        self.device.inner.flush(true)?;
+        let mut best_f32 = u64::MAX;
+        let mut best_f16 = u64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            run(candle_vulkan_kernels::MATMUL_F16, "matmul_f16")?;
+            self.device.inner.flush(true)?;
+            best_f32 = best_f32.min(t.elapsed().as_nanos() as u64);
+            let t = std::time::Instant::now();
+            run(candle_vulkan_kernels::MATMUL_F16C, "matmul_f16c")?;
+            self.device.inner.flush(true)?;
+            best_f16 = best_f16.min(t.elapsed().as_nanos() as u64);
+        }
+        let chosen = best_f16 * 50 < best_f32 * 49;
+        let _ = self.device.inner.set_matmul_f16_compute(chosen);
+        if std::env::var("CANDLE_VULKAN_DEBUG_MATMUL").is_ok() {
+            eprintln!(
+                "[matmul] f16c-bench f32={best_f32}ns f16c={best_f16}ns -> {}",
+                if chosen { "f16c" } else { "f32" }
+            );
+        }
+        Ok(chosen)
+    }
 }
 
 impl BackendStorage for VulkanStorage {
@@ -941,6 +1034,9 @@ impl BackendStorage for VulkanStorage {
         if narrow && n % 2 == 1 {
             return Err(not_yet("matmul(narrow: odd n)"));
         }
+        // Native-fp16 compute decision (device-level, latched; only for f16 on
+        // fp16-ALU parts). Consulted by both the split-K and base dispatch sites.
+        let use_f16c = self.matmul_select_f16c(dt)?;
         let l_rank = l_layout.dims().len();
         let r_rank = r_layout.dims().len();
         if !(2..=4).contains(&l_rank) || l_rank != r_rank {
@@ -1021,12 +1117,19 @@ impl BackendStorage for VulkanStorage {
                     k_splits as u32,
                     split_stride as u32,
                 ];
-                let (sk_spv, sk_name) = pick_dt!(
-                    dt,
-                    (candle_vulkan_kernels::MATMUL_F32_SPLITK, "matmul_f32_splitk"),
-                    (candle_vulkan_kernels::MATMUL_F16_SPLITK, "matmul_f16_splitk"),
-                    (candle_vulkan_kernels::MATMUL_BF16_SPLITK, "matmul_bf16_splitk")
-                );
+                let (sk_spv, sk_name) = if dt == DType::F16 && use_f16c {
+                    (
+                        candle_vulkan_kernels::MATMUL_F16C_SPLITK,
+                        "matmul_f16c_splitk",
+                    )
+                } else {
+                    pick_dt!(
+                        dt,
+                        (candle_vulkan_kernels::MATMUL_F32_SPLITK, "matmul_f32_splitk"),
+                        (candle_vulkan_kernels::MATMUL_F16_SPLITK, "matmul_f16_splitk"),
+                        (candle_vulkan_kernels::MATMUL_BF16_SPLITK, "matmul_bf16_splitk")
+                    )
+                };
                 self.device.inner.dispatch(
                     sk_spv,
                     sk_name,
@@ -1090,12 +1193,16 @@ impl BackendStorage for VulkanStorage {
             (n.div_ceil(64)).min(65535) as u32,
             b as u32,
         );
-        let (spv, name) = pick_dt!(
-            dt,
-            (candle_vulkan_kernels::MATMUL_F32, "matmul_f32"),
-            (candle_vulkan_kernels::MATMUL_F16, "matmul_f16"),
-            (candle_vulkan_kernels::MATMUL_BF16, "matmul_bf16")
-        );
+        let (spv, name) = if dt == DType::F16 && use_f16c {
+            (candle_vulkan_kernels::MATMUL_F16C, "matmul_f16c")
+        } else {
+            pick_dt!(
+                dt,
+                (candle_vulkan_kernels::MATMUL_F32, "matmul_f32"),
+                (candle_vulkan_kernels::MATMUL_F16, "matmul_f16"),
+                (candle_vulkan_kernels::MATMUL_BF16, "matmul_bf16")
+            )
+        };
         self.device.inner.dispatch(
             spv,
             name,

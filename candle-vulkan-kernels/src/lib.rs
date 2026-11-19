@@ -137,6 +137,9 @@ pub const MATMUL_F16_SPLITK: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f16_splitk.spv"));
 pub const MATMUL_F16_REDUCE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f16_reduce.spv"));
+pub const MATMUL_F16C: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f16c.spv"));
+pub const MATMUL_F16C_SPLITK: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f16c_splitk.spv"));
 pub const MATMUL_BF16_SPLITK: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_bf16_splitk.spv"));
 pub const MATMUL_BF16_REDUCE: &[u8] =
