@@ -366,6 +366,172 @@ impl VulkanStorage {
         }
         Ok(chosen)
     }
+
+    /// Decide (once per device) whether f16 matmuls use the cooperative-matrix
+    /// kernel. Requires f16 dtype, fp16 ALUs, a device-reported coopmat tile, and
+    /// a non-empty compiled kernel (the build may have stubbed it out). Latched by
+    /// a benchmark + output-correctness check on the second coopmat-eligible call.
+    /// `CANDLE_VULKAN_MATMUL_COMPUTE=coopmat|f16|f32` forces a choice (f16/f32 keep
+    /// the non-coopmat path).
+    fn matmul_select_coopmat(&self, dt: DType) -> Result<bool> {
+        if dt != DType::F16
+            || !self.device.inner.fp16_compute()
+            || !self.device.inner.coopmat_available()
+            || candle_vulkan_kernels::MATMUL_COOPMAT.is_empty()
+        {
+            return Ok(false);
+        }
+        let call_idx = self.device.inner.bump_matmul_coopmat_calls();
+        Ok(
+            match std::env::var("CANDLE_VULKAN_MATMUL_COMPUTE")
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("coopmat") => true,
+                Some("f16") | Some("f32") => false,
+                _ => match self.device.inner.matmul_coopmat() {
+                    Some(d) => d,
+                    None if call_idx >= 1 => self.benchmark_matmul_coopmat()?,
+                    None => false,
+                },
+            },
+        )
+    }
+
+    /// Benchmark the coopmat kernel against the native-fp16 and f32 base kernels on
+    /// a representative compute-bound GEMM (col-major rhs, matching the model's
+    /// `x @ W^T` linear layers), and verify the coopmat output matches f16c before
+    /// ever enabling it. Coopmat is chosen only if it is >2% faster than the best
+    /// f16 path AND its output cosine vs f16c exceeds 0.99 (a gross layout / OOB
+    /// bug drops cosine far below this, so an untested kernel self-disables rather
+    /// than corrupting embeddings). Latched for the device's lifetime.
+    fn benchmark_matmul_coopmat(&self) -> Result<bool> {
+        let (m, n, k) = (512usize, 1024usize, 1024usize);
+        let lhs = self.device.alloc(m * k, DType::F16)?;
+        let rhs = self.device.alloc(k * n, DType::F16)?;
+        let out = self.device.alloc(m * n, DType::F16)?;
+        let zero = self.device.inner.coopmat_zero()?;
+        // Base push block: contiguous lhs[m,k] (lm=k, lk=1), col-major rhs[k,n]
+        // (rk=1, rn=k), out[m,n], batch 1.
+        let pc = [
+            0u32,
+            0,
+            0,
+            m as u32,
+            n as u32,
+            k as u32,
+            0,
+            0,
+            k as u32,
+            1,
+            0,
+            0,
+            1,
+            k as u32,
+            (m * n) as u32,
+            1,
+        ];
+        let grid = (
+            m.div_ceil(64).min(65535) as u32,
+            n.div_ceil(64).min(65535) as u32,
+            1u32,
+        );
+        let cgrid = (
+            m.div_ceil(16).min(65535) as u32,
+            n.div_ceil(16).min(65535) as u32,
+            1u32,
+        );
+        let run_f32 = |out: &Arc<VulkanBuffer>| -> Result<()> {
+            self.device.inner.dispatch(
+                candle_vulkan_kernels::MATMUL_F16,
+                "matmul_f16",
+                &[&lhs, &rhs, out],
+                &pc,
+                grid,
+            )
+        };
+        let run_f16c = |out: &Arc<VulkanBuffer>| -> Result<()> {
+            self.device.inner.dispatch(
+                candle_vulkan_kernels::MATMUL_F16C,
+                "matmul_f16c",
+                &[&lhs, &rhs, out],
+                &pc,
+                grid,
+            )
+        };
+        let run_coop = |out: &Arc<VulkanBuffer>| -> Result<()> {
+            self.device.inner.dispatch(
+                candle_vulkan_kernels::MATMUL_COOPMAT,
+                "matmul_coopmat",
+                &[&lhs, &rhs, out, &zero],
+                &pc,
+                cgrid,
+            )
+        };
+
+        // Correctness gate: run f16c then coopmat into `out`, read both back, and
+        // require they agree. Warm both (excludes shader compile).
+        run_f16c(&out)?;
+        self.device.inner.flush(true)?;
+        let ref_out = self.device.inner.copy_d2h(&out, m * n * 2)?;
+        run_coop(&out)?;
+        self.device.inner.flush(true)?;
+        let coop_out = self.device.inner.copy_d2h(&out, m * n * 2)?;
+        let cos = f16_cosine(&ref_out, &coop_out);
+        let correct = cos > 0.99;
+
+        let mut chosen = false;
+        if correct {
+            let mut best_f32 = u64::MAX;
+            let mut best_f16 = u64::MAX;
+            let mut best_co = u64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                run_f32(&out)?;
+                self.device.inner.flush(true)?;
+                best_f32 = best_f32.min(t.elapsed().as_nanos() as u64);
+                let t = std::time::Instant::now();
+                run_f16c(&out)?;
+                self.device.inner.flush(true)?;
+                best_f16 = best_f16.min(t.elapsed().as_nanos() as u64);
+                let t = std::time::Instant::now();
+                run_coop(&out)?;
+                self.device.inner.flush(true)?;
+                best_co = best_co.min(t.elapsed().as_nanos() as u64);
+            }
+            let best = best_f32.min(best_f16);
+            chosen = best_co * 50 < best * 49;
+        }
+        let _ = self.device.inner.set_matmul_coopmat(chosen);
+        if std::env::var("CANDLE_VULKAN_DEBUG_MATMUL").is_ok() {
+            eprintln!(
+                "[matmul] coopmat-bench cos={cos:.5} correct={correct} -> {}",
+                if chosen { "coopmat" } else { "off" }
+            );
+        }
+        Ok(chosen)
+    }
+}
+
+/// Cosine similarity between two little-endian f16 buffers (packed f16 output).
+fn f16_cosine(a: &[u8], b: &[u8]) -> f64 {
+    let va = a
+        .chunks_exact(2)
+        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32() as f64);
+    let vb = b
+        .chunks_exact(2)
+        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32() as f64);
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in va.zip(vb) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 impl BackendStorage for VulkanStorage {
@@ -1072,6 +1238,63 @@ impl BackendStorage for VulkanStorage {
                 r_layout.stride()[3] as u32,
             ),
         };
+        // Cooperative-matrix path: on coopmat-capable devices, route eligible f16
+        // matmuls to the hardware-tile kernel INSTEAD of split-K (its 16x16 tiling
+        // already spawns enough workgroups to fill the GPU). Eligible when m>=16,
+        // n and k are multiples of 16, and both operands are row- or col-major (a
+        // stride of 1 in one dimension); otherwise fall through to f16c/f32. The
+        // device-level on/off decision is benchmarked + correctness-checked once.
+        if self.matmul_select_coopmat(dt)?
+            && m >= 16
+            && n % 16 == 0
+            && k % 16 == 0
+            && (lk == 1 || lm == 1)
+            && (rn == 1 || rk == 1)
+        {
+            let numel = b * m * n;
+            let out = self.device.alloc(numel, self.dtype)?;
+            let zero = self.device.inner.coopmat_zero()?;
+            let pc = [
+                l_layout.start_offset() as u32,
+                r_layout.start_offset() as u32,
+                0u32,
+                m as u32,
+                n as u32,
+                k as u32,
+                lb0,
+                lb1,
+                lm,
+                lk,
+                rb0,
+                rb1,
+                rk,
+                rn,
+                (m * n) as u32,
+                if l_rank == 4 {
+                    l_layout.dims()[1] as u32
+                } else {
+                    1
+                },
+            ];
+            let groups = (
+                (m.div_ceil(16)).min(65535) as u32,
+                (n.div_ceil(16)).min(65535) as u32,
+                b as u32,
+            );
+            self.device.inner.dispatch(
+                candle_vulkan_kernels::MATMUL_COOPMAT,
+                "matmul_coopmat",
+                &[&self.buffer, &r.buffer, &out, &zero],
+                &pc,
+                groups,
+            )?;
+            return Ok(Self {
+                device: self.device.clone(),
+                buffer: out,
+                len: numel,
+                dtype: self.dtype,
+            });
+        }
         let numel = b * m * n;
         // Split-K: when the plain 64x64 tiling spawns too few workgroups to fill
         // the GPU (small M/N) but K is long, split K across workgroups into partial

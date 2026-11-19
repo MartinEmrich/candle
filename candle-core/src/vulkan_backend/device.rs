@@ -286,6 +286,21 @@ pub struct VulkanDeviceInner {
     matmul_f16_compute: OnceLock<bool>,
     /// Number of matmul dispatches so far; the first one triggers the benchmark.
     matmul_calls: AtomicUsize,
+    /// Cooperative-matrix matmul decision (see `matmul_coopmat()`). Only ever
+    /// `true` on a device that supports VK_KHR_cooperative_matrix with a matching
+    /// m=n=k=16 f16/f16/f32/subgroup tile AND passes a runtime benchmark plus an
+    /// output-correctness check vs f32. `None` until decided; `false` is safe.
+    matmul_coopmat: OnceLock<bool>,
+    /// Number of coopmat-eligible matmul dispatches; the first triggers the
+    /// coopmat benchmark (independent of the f16c counter above).
+    matmul_coopmat_calls: AtomicUsize,
+    /// Whether this device supports the cooperative-matrix matmul at all (the
+    /// extension is present and a tile config matching the kernel is reported).
+    /// When false, the coopmat kernel is never offered regardless of benchmark.
+    coopmat_available: bool,
+    /// Persistent 16x16 f32 zero buffer used to zero the coopmat accumulator.
+    /// Allocated lazily on the first coopmat dispatch (see `coopmat_zero()`).
+    coopmat_zero: OnceLock<Arc<VulkanBuffer>>,
     ordinal: usize,
     name: String,
 }
@@ -420,6 +435,59 @@ impl VulkanDeviceInner {
         };
         let fp16_compute = shader_float16 && storage_buffer16;
 
+        // Cooperative-matrix matmul support: needs the VK_KHR_cooperative_matrix
+        // device extension AND a tile config that matches the coopmat kernel
+        // (m=n=k=16, a=b=f16, c=result=f32, scope=subgroup, non-saturating).
+        // Only when both hold is the coopmat kernel ever offered; the extension is
+        // then enabled at device creation. Absent devices (Xe-LP, GCN4) see no
+        // change (extension not enabled, coopmat never selected).
+        let coopmat_available = unsafe {
+            let ext = ash::khr::cooperative_matrix::Instance::new(
+                &instance._entry,
+                &instance.instance,
+            );
+            let present = instance
+                .instance
+                .enumerate_device_extension_properties(physical_device)
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
+                            == vk::KHR_COOPERATIVE_MATRIX_NAME
+                    })
+                })
+                .unwrap_or(false);
+            // The kernel runs one 32-thread workgroup = an integer number of
+            // subgroups; a subgroup size that does not divide 32 (e.g. 64) would
+            // make the Subgroup-scope cooperative matrix undefined, so require it
+            // to divide 32.
+            let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+            instance
+                .instance
+                .get_physical_device_properties2(physical_device, &mut props2);
+            drop(props2);
+            let subgroup_ok = subgroup.subgroup_size != 0 && 32 % subgroup.subgroup_size == 0;
+            if present && subgroup_ok {
+                ext.get_physical_device_cooperative_matrix_properties(physical_device)
+                    .map(|props| {
+                        props.iter().any(|p| {
+                            p.m_size == 16
+                                && p.n_size == 16
+                                && p.k_size == 16
+                                && p.a_type == vk::ComponentTypeKHR::FLOAT16
+                                && p.b_type == vk::ComponentTypeKHR::FLOAT16
+                                && p.c_type == vk::ComponentTypeKHR::FLOAT32
+                                && p.result_type == vk::ComponentTypeKHR::FLOAT32
+                                && p.scope == vk::ScopeKHR::SUBGROUP
+                                && p.saturating_accumulation == 0
+                        })
+                    })
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        };
+
         if std::env::var("CANDLE_VULKAN_INFO").is_ok() {
             let l = &props.limits;
             let api = props.api_version;
@@ -448,6 +516,10 @@ impl VulkanDeviceInner {
                 l.min_storage_buffer_offset_alignment,
                 l.buffer_image_granularity,
             );
+            eprintln!(
+                "[candle-vulkan]   coopmat: available={} (VK_KHR_cooperative_matrix, 16x16x16 f16/f16/f32/subgroup)",
+                coopmat_available
+            );
         }
 
         let priority = [1.0f32];
@@ -455,18 +527,33 @@ impl VulkanDeviceInner {
             .queue_family_index(queue_family)
             .queue_priorities(&priority);
         // Enable `shaderFloat16` when the device supports it so kernels may use
-        // the native fp16 ALUs (the fp16-compute FA variant needs it). 1.1+
-        // features must ride a PhysicalDeviceFeatures2 pNext chain; the v1
-        // `enabled_features` path cannot express them. Devices without fp16 keep
-        // the plain default-feature path untouched.
+        // the native fp16 ALUs (the fp16-compute FA variant needs it), and enable
+        // `VK_KHR_cooperative_matrix` (plus its feature) when the device supports
+        // the coopmat matmul tile. 1.1+ features must ride a
+        // PhysicalDeviceFeatures2 pNext chain; the v1 `enabled_features` path
+        // cannot express them. Devices with neither keep the plain default-feature
+        // path untouched.
         let mut fp16_features =
             vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
-        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut fp16_features);
+        let mut coopmat_feature =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        let mut features2 = vk::PhysicalDeviceFeatures2::default();
+        if coopmat_available {
+            features2 = features2.push_next(&mut coopmat_feature);
+        }
+        if shader_float16 {
+            features2 = features2.push_next(&mut fp16_features);
+        }
+        let enabled_ext_names = [vk::KHR_COOPERATIVE_MATRIX_NAME.as_ptr()];
         let base_features = vk::PhysicalDeviceFeatures::default();
-        let device_ci = if shader_float16 {
-            vk::DeviceCreateInfo::default()
+        let device_ci = if shader_float16 || coopmat_available {
+            let mut ci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(std::slice::from_ref(&queue_ci))
-                .push_next(&mut features2)
+                .push_next(&mut features2);
+            if coopmat_available {
+                ci = ci.enabled_extension_names(&enabled_ext_names);
+            }
+            ci
         } else {
             vk::DeviceCreateInfo::default()
                 .queue_create_infos(std::slice::from_ref(&queue_ci))
@@ -562,6 +649,10 @@ impl VulkanDeviceInner {
             fa_f16_compute: OnceLock::new(),
             matmul_f16_compute: OnceLock::new(),
             matmul_calls: AtomicUsize::new(0),
+            matmul_coopmat: OnceLock::new(),
+            matmul_coopmat_calls: AtomicUsize::new(0),
+            coopmat_available,
+            coopmat_zero: OnceLock::new(),
             ordinal,
             name,
         })
@@ -632,6 +723,47 @@ impl VulkanDeviceInner {
     pub fn set_matmul_f16_compute(&self, use_f16: bool) -> bool {
         let _ = self.matmul_f16_compute.set(use_f16);
         self.matmul_f16_compute.get().copied().unwrap_or(false)
+    }
+
+    /// Whether the device supports the cooperative-matrix matmul (extension +
+    /// matching tile config). Independent of the benchmark decision below.
+    pub fn coopmat_available(&self) -> bool {
+        self.coopmat_available
+    }
+
+    /// Increment and return the coopmat-eligible matmul counter (pre-increment
+    /// value). The first eligible call (value 0) is skipped (shader compile); the
+    /// second triggers the coopmat benchmark.
+    pub fn bump_matmul_coopmat_calls(&self) -> usize {
+        self.matmul_coopmat_calls.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Current cooperative-matrix matmul decision: `Some(true)` use the coopmat
+    /// kernel, `Some(false)` use f16c/f32, `None` undecided (benchmark it).
+    pub fn matmul_coopmat(&self) -> Option<bool> {
+        self.matmul_coopmat.get().copied()
+    }
+
+    /// Latch the cooperative-matrix matmul decision (first writer wins).
+    pub fn set_matmul_coopmat(&self, use_coopmat: bool) -> bool {
+        let _ = self.matmul_coopmat.set(use_coopmat);
+        self.matmul_coopmat.get().copied().unwrap_or(false)
+    }
+
+    /// Persistent 16x16 f32 zero buffer for zeroing the coopmat accumulator.
+    /// Allocated and zeroed once (first call), then reused.
+    pub fn coopmat_zero(self: &Arc<Self>) -> Result<Arc<VulkanBuffer>> {
+        if let Some(z) = self.coopmat_zero.get() {
+            return Ok(z.clone());
+        }
+        let bytes = 16 * 16 * 4;
+        let buf = self.alloc_device(bytes)?;
+        self.fill_buffer(&buf, 0, bytes, 0)?;
+        // Zero the buffer before any coopmat dispatch reads it (the fill is a
+        // deferred op; flush so the first coopmat read observes the zeros).
+        self.flush(true)?;
+        let _ = self.coopmat_zero.set(buf.clone());
+        Ok(buf)
     }
 
     pub fn name(&self) -> &str {

@@ -140,6 +140,10 @@ pub const MATMUL_F16_REDUCE: &[u8] =
 pub const MATMUL_F16C: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f16c.spv"));
 pub const MATMUL_F16C_SPLITK: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f16c_splitk.spv"));
+// Cooperative-matrix matmul. Compiled at Vulkan 1.3 only when the build-time glslc
+// supports VK_KHR_cooperative_matrix; otherwise build.rs emits an empty stub and
+// the host never dispatches it (it checks `MATMUL_COOPMAT.is_empty()`).
+pub const MATMUL_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_coopmat.spv"));
 pub const MATMUL_BF16_SPLITK: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/matmul_bf16_splitk.spv"));
 pub const MATMUL_BF16_REDUCE: &[u8] =
